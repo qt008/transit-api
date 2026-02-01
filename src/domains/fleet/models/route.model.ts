@@ -3,6 +3,7 @@ import { Role } from '../../identity/models/user.model';
 
 export interface RouteStop {
     stopId: string;
+    branchId: string;
     name: string;
     location: {
         type: string;
@@ -10,6 +11,7 @@ export interface RouteStop {
     };
     sequence: number; // Order in route
     estimatedArrivalMinutes: number; // Minutes from route start
+    price?: number; // Price from origin to this stop (in pesewas)
 }
 
 export interface RouteAccessControl {
@@ -22,6 +24,9 @@ export interface IRoute extends Document {
     routeId: string;
     name: string;
     operatorId: string;
+
+    originBranchId: string;
+    destinationBranchId: string;
 
     // Route path
     geometry: {
@@ -46,19 +51,24 @@ export interface IRoute extends Document {
 
 const RouteStopSchema = new Schema({
     stopId: { type: String, required: true },
+    branchId: { type: String, required: true },
     name: { type: String, required: true },
     location: {
         type: { type: String, enum: ['Point'], default: 'Point' },
         coordinates: { type: [Number], required: true }
     },
     sequence: { type: Number, required: true },
-    estimatedArrivalMinutes: { type: Number, required: true }
+    estimatedArrivalMinutes: { type: Number, required: true },
+    price: { type: Number } // Optional specific price
 }, { _id: false });
 
 const RouteSchema = new Schema({
     routeId: { type: String, required: true, unique: true },
     name: { type: String, required: true },
     operatorId: { type: String, required: true, index: true },
+
+    originBranchId: { type: String, required: true, index: true },
+    destinationBranchId: { type: String, required: true, index: true },
 
     geometry: {
         type: { type: String, enum: ['LineString'], default: 'LineString' },

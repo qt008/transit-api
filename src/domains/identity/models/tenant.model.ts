@@ -13,6 +13,12 @@ export interface ITenant extends Document {
     type: TenantType;
     config: Record<string, any>; // Generic config
     isActive: boolean;
+
+    // Organization details
+    logo?: string; // URL to logo image
+    contactEmail?: string;
+    contactPhone?: string;
+    address?: string;
 }
 
 const TenantSchema = new Schema<ITenant>(
@@ -22,6 +28,12 @@ const TenantSchema = new Schema<ITenant>(
         type: { type: String, enum: Object.values(TenantType), required: true },
         config: { type: Schema.Types.Mixed, default: {} },
         isActive: { type: Boolean, default: true },
+
+        // Organization details
+        logo: { type: String },
+        contactEmail: { type: String },
+        contactPhone: { type: String },
+        address: { type: String },
     },
     { timestamps: true }
 );

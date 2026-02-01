@@ -1,5 +1,6 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
-import { UserModel } from '../models/user.model';
+import { UserModel, Role } from '../models/user.model';
+import { UserService, CreateUserDto, UpdateUserDto, UserListFilters } from '../services/user.service';
 import { z } from 'zod';
 
 const UpdateProfileSchema = z.object({
@@ -15,6 +16,33 @@ const UpdatePreferencesSchema = z.object({
         email: z.boolean().optional()
     }).optional(),
     language: z.string().optional()
+});
+
+const CreateUserSchema = z.object({
+    email: z.string().email().optional(),
+    phone: z.string().min(10),
+    password: z.string().min(8),
+    firstName: z.string().min(2),
+    lastName: z.string().min(2),
+    role: z.nativeEnum(Role),
+    tenantId: z.string().optional(),
+    primaryBranchId: z.string().optional(),
+    branchIds: z.array(z.string()).optional(),
+});
+
+const UpdateUserSchema = z.object({
+    email: z.string().email().optional(),
+    phone: z.string().min(10).optional(),
+    firstName: z.string().min(2).optional(),
+    lastName: z.string().min(2).optional(),
+    role: z.nativeEnum(Role).optional(),
+    primaryBranchId: z.string().optional(),
+    branchIds: z.array(z.string()).optional(),
+    mfaEnabled: z.boolean().optional(),
+});
+
+const ResetPasswordSchema = z.object({
+    newPassword: z.string().min(8),
 });
 
 export class UserController {
@@ -137,5 +165,210 @@ export class UserController {
             success: true,
             message: 'Account deleted successfully'
         });
+    }
+
+    // ========== ADMIN USER MANAGEMENT ENDPOINTS ==========
+
+    /**
+     * POST /users - Create new user (admin only)
+     */
+    static async createUser(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const userData = CreateUserSchema.parse(req.body);
+            const requester = req.user as any;
+
+            const requesterUser = await UserModel.findOne({ userId: requester.id });
+            if (!requesterUser) {
+                return reply.status(404).send({ error: 'Requester not found' });
+            }
+
+            const newUser = await UserService.createUser(requesterUser, userData as CreateUserDto);
+
+            return reply.status(201).send({
+                success: true,
+                data: newUser,
+                message: 'User created successfully'
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * GET /users - List all users (admin only)
+     */
+    static async listUsers(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const requester = req.user as any;
+            const requesterUser = await UserModel.findOne({ userId: requester.id });
+
+            if (!requesterUser) {
+                return reply.status(404).send({ error: 'Requester not found' });
+            }
+
+            const query = req.query as any;
+            const filters: UserListFilters = {
+                tenantId: query.tenantId,
+                role: query.role as Role,
+                branchId: query.branchId,
+                search: query.search,
+                page: query.page ? parseInt(query.page) : 1,
+                limit: query.limit ? parseInt(query.limit) : 20,
+            };
+
+            const result = await UserService.listUsers(requesterUser, filters);
+
+            return reply.send({
+                success: true,
+                ...result
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * GET /users/:userId - Get user by ID (admin only)
+     */
+    static async getUserById(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const { userId } = req.params as { userId: string };
+            const requester = req.user as any;
+            const requesterUser = await UserModel.findOne({ userId: requester.id });
+
+            if (!requesterUser) {
+                return reply.status(404).send({ error: 'Requester not found' });
+            }
+
+            const user = await UserService.getUserById(userId);
+
+            if (!user) {
+                return reply.status(404).send({ error: 'User not found' });
+            }
+
+            // Check permissions - can only view users in same tenant unless super admin
+            if (requesterUser.roles[0] !== Role.SUPER_ADMIN) {
+                if (user.tenantId !== requesterUser.tenantId) {
+                    return reply.status(403).send({
+                        error: 'You can only view users in your organization'
+                    });
+                }
+            }
+
+            return reply.send({
+                success: true,
+                data: user
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * PATCH /users/:userId - Update user (admin only)
+     */
+    static async updateUser(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const { userId } = req.params as { userId: string };
+            const updates = UpdateUserSchema.parse(req.body);
+            const requester = req.user as any;
+
+            const updatedUser = await UserService.updateUser(
+                requester.id,
+                userId,
+                updates as UpdateUserDto
+            );
+
+            if (!updatedUser) {
+                return reply.status(404).send({ error: 'User not found' });
+            }
+
+            return reply.send({
+                success: true,
+                data: updatedUser,
+                message: 'User updated successfully'
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * POST /users/:userId/deactivate - Deactivate user (admin only)
+     */
+    static async deactivateUser(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const { userId } = req.params as { userId: string };
+            const requester = req.user as any;
+
+            await UserService.deactivateUser(requester.id, userId);
+
+            return reply.send({
+                success: true,
+                message: 'User deactivated successfully'
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * POST /users/:userId/reactivate - Reactivate user (admin only)
+     */
+    static async reactivateUser(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const { userId } = req.params as { userId: string };
+            const requester = req.user as any;
+
+            await UserService.reactivateUser(requester.id, userId);
+
+            return reply.send({
+                success: true,
+                message: 'User reactivated successfully'
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
+    }
+
+    /**
+     * POST /users/:userId/reset-password - Reset user password (admin only)
+     */
+    static async resetUserPassword(req: FastifyRequest, reply: FastifyReply) {
+        try {
+            const { userId } = req.params as { userId: string };
+            const { newPassword } = ResetPasswordSchema.parse(req.body);
+            const requester = req.user as any;
+
+            await UserService.resetUserPassword(requester.id, userId, newPassword);
+
+            return reply.send({
+                success: true,
+                message: 'Password reset successfully'
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message
+            });
+        }
     }
 }

@@ -3,6 +3,8 @@ import { TenantModel, TenantType } from '../models/tenant.model';
 import { WalletService } from '../../wallet/services/wallet.service';
 import { AccountType } from '../../wallet/models/account.model';
 import { PasswordResetModel } from '../models/password-reset.model';
+import { OTPModel } from '../models/otp.model';
+import { SMSService } from '../../../services/sms.service';
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'crypto';
 import crypto from 'crypto';
@@ -24,9 +26,11 @@ interface RegisterRequest {
 
 export class AuthService {
     private walletService: WalletService;
+    private smsService: SMSService;
 
     constructor() {
         this.walletService = new WalletService();
+        this.smsService = new SMSService();
     }
 
     async registerUser(req: RegisterRequest): Promise<IUser> {
@@ -85,7 +89,30 @@ export class AuthService {
             throw new Error('Invalid credentials');
         }
 
-        // Generate Tokens
+        // ✅ Create sanitized user object - NO sensitive data
+        const safeUser = {
+            userId: user.userId,
+            email: user.email,
+            phone: user.phone,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            name: `${user.firstName} ${user.lastName}`,
+            roles: user.roles,
+            role: user.roles[0],
+            tenantId: user.tenantId,
+            mfaEnabled: user.mfaEnabled,
+        };
+
+        // If 2FA is enabled, don't return tokens yet
+        if (user.mfaEnabled) {
+            return {
+                user: safeUser,
+                requiresOtp: true,
+                // No tokens - they'll get them after OTP verification
+            };
+        }
+
+        // No 2FA - generate and return tokens
         const accessToken = jwt.sign(
             { id: user.userId, role: user.roles[0], tenantId: user.tenantId },
             JWT_SECRET,
@@ -93,12 +120,12 @@ export class AuthService {
         );
 
         const refreshToken = jwt.sign(
-            { id: user.userId, version: 1 }, // Simple versioning for rotation
+            { id: user.userId, version: 1 },
             REFRESH_SECRET,
             { expiresIn: '7d' }
         );
 
-        return { user, accessToken, refreshToken };
+        return { user: safeUser, accessToken, refreshToken, requiresOtp: false };
     }
 
     /**
@@ -161,5 +188,122 @@ export class AuthService {
 
         user.passwordHash = await bcrypt.hash(newPassword, 12);
         await user.save();
+    }
+
+    /**
+     * Generate and send OTP for login
+     */
+    async sendLoginOTP(userId: string, phone: string): Promise<void> {
+        // Generate 6-digit code
+        const code = crypto.randomInt(100000, 999999).toString();
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+        // Invalidate previous unverified OTPs
+        await OTPModel.updateMany(
+            { userId, verified: false },
+            { verified: true }
+        );
+
+        // Create new OTP
+        await OTPModel.create({
+            userId,
+            code,
+            expiresAt,
+            verified: false,
+            attempts: 0,
+        });
+
+        // Send via SMS
+        await this.smsService.sendOTP(phone, code);
+    }
+
+    /**
+     * Verify OTP and return tokens
+     */
+    async verifyLoginOTP(userId: string, code: string) {
+        const otp = await OTPModel.findOne({
+            userId,
+            code,
+            verified: false,
+            expiresAt: { $gt: new Date() },
+        });
+
+        if (!otp) {
+            // Track failed attempts to prevent brute force
+            await OTPModel.updateOne(
+                { userId, code },
+                { $inc: { attempts: 1 } }
+            );
+            throw new Error('Invalid or expired OTP');
+        }
+
+        // Check attempt limit (max 3 tries)
+        if (otp.attempts >= 3) {
+            otp.verified = true; // Invalidate
+            await otp.save();
+            throw new Error('Too many failed attempts. Request new OTP.');
+        }
+
+        // Mark as verified
+        otp.verified = true;
+        await otp.save();
+
+        // Get user for token generation
+        const user = await UserModel.findOne({ userId });
+        if (!user) throw new Error('User not found');
+
+        // Generate tokens
+        const accessToken = jwt.sign(
+            { id: user.userId, role: user.roles[0], tenantId: user.tenantId },
+            JWT_SECRET,
+            { expiresIn: '15m' }
+        );
+
+        const refreshToken = jwt.sign(
+            { id: user.userId, version: 1 },
+            REFRESH_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        const safeUser = {
+            userId: user.userId,
+            email: user.email,
+            phone: user.phone,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            name: `${user.firstName} ${user.lastName}`,
+            roles: user.roles,
+            role: user.roles[0],
+            tenantId: user.tenantId,
+        };
+
+        return { user: safeUser, accessToken, refreshToken };
+    }
+
+    /**
+     * Refresh access token using refresh token
+     */
+    async refreshAccessToken(refreshToken: string) {
+        try {
+            // Verify refresh token
+            const decoded = jwt.verify(refreshToken, REFRESH_SECRET) as { id: string; version: number };
+
+            // Get user
+            const user = await UserModel.findOne({ userId: decoded.id });
+            if (!user) {
+                throw new Error('User not found');
+            }
+
+            // Generate new access token
+            const accessToken = jwt.sign(
+                { id: user.userId, role: user.roles[0], tenantId: user.tenantId },
+                JWT_SECRET,
+                { expiresIn: '15m' }
+            );
+
+            return { accessToken };
+        } catch (error) {
+            throw new Error('Invalid or expired refresh token');
+        }
     }
 }

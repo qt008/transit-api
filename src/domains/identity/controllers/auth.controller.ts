@@ -1,6 +1,6 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { AuthService } from '../services/auth.service';
-import { Role } from '../models/user.model';
+import { Role, UserModel } from '../models/user.model';
 import { z } from 'zod';
 import { AuditLogger, AuditAction } from '../../../shared/kernel/audit.logger';
 
@@ -60,9 +60,25 @@ export class AuthController {
 
             AuditLogger.logAuth(AuditAction.USER_LOGIN, result.user.userId, true, {
                 emailOrPhone,
+                requiresOtp: result.requiresOtp,
                 ipAddress: req.ip
             });
 
+            // If 2FA required, send OTP
+            if (result.requiresOtp) {
+                await authService.sendLoginOTP(result.user.userId, result.user.phone);
+
+                return reply.send({
+                    success: true,
+                    data: {
+                        userId: result.user.userId,
+                        requiresOtp: true,
+                        message: 'OTP sent to your phone',
+                    }
+                });
+            }
+
+            // No 2FA - return tokens
             return reply.send({
                 success: true,
                 data: result
@@ -130,6 +146,72 @@ export class AuthController {
             });
         } catch (err: any) {
             return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    static async verifyOTP(req: FastifyRequest, reply: FastifyReply) {
+        const { userId, code } = z.object({
+            userId: z.string(),
+            code: z.string().length(6),
+        }).parse(req.body);
+
+        try {
+            const result = await authService.verifyLoginOTP(userId, code);
+
+            AuditLogger.logAuth(AuditAction.USER_LOGIN, userId, true, {
+                method: 'OTP_VERIFIED',
+                ipAddress: req.ip
+            });
+
+            return reply.send({
+                success: true,
+                data: result
+            });
+        } catch (err: any) {
+            AuditLogger.logAuth(AuditAction.USER_LOGIN, userId, false, {
+                method: 'OTP_FAILED',
+                error: err.message,
+                ipAddress: req.ip
+            });
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    static async resendOTP(req: FastifyRequest, reply: FastifyReply) {
+        const { userId } = z.object({ userId: z.string() }).parse(req.body);
+
+        try {
+            const user = await UserModel.findOne({ userId });
+            if (!user) throw new Error('User not found');
+
+            await authService.sendLoginOTP(userId, user.phone);
+
+            AuditLogger.logAuth(AuditAction.USER_LOGIN, userId, true, {
+                method: 'OTP_RESENT',
+                ipAddress: req.ip
+            });
+
+            return reply.send({
+                success: true,
+                message: 'OTP resent successfully'
+            });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    static async refresh(req: FastifyRequest, reply: FastifyReply) {
+        const { refreshToken } = z.object({ refreshToken: z.string() }).parse(req.body);
+
+        try {
+            const result = await authService.refreshAccessToken(refreshToken);
+
+            return reply.send({
+                success: true,
+                data: result
+            });
+        } catch (err: any) {
+            return reply.status(401).send({ error: err.message });
         }
     }
 }

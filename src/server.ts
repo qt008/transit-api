@@ -17,6 +17,7 @@ import { connectDatabase } from './database/database.module';
 import { errorHandler } from './shared/kernel/error.handler';
 import { requestIdMiddleware } from './shared/kernel/request-id.middleware';
 import { sanitizationMiddleware, xssProtection } from './shared/kernel/sanitization.middleware';
+import { branchRoutes } from './domains/fleet/branch.routes';
 
 const app = fastify({
     logger: {
@@ -68,6 +69,12 @@ const start = async () => {
 
         await app.register(compress, { encodings: ['gzip', 'deflate'] });
 
+        await app.register(import('@fastify/multipart'), {
+            limits: {
+                fileSize: 10 * 1024 * 1024 // 10MB limit
+            }
+        });
+
         // 3. Global Middleware
         app.addHook('onRequest', requestIdMiddleware);
         app.addHook('preHandler', sanitizationMiddleware);
@@ -99,7 +106,10 @@ const start = async () => {
             dash.register(driverRoutes, { prefix: '/drivers' });
             dash.register(walletRoutes, { prefix: '/finance' });
             dash.register(fleetRoutes, { prefix: '/ops' });
+            dash.register(branchRoutes, { prefix: '/branches' });
             dash.register(analyticsRoutes, { prefix: '/analytics' });
+            dash.register(userRoutes, { prefix: '/users' });
+            dash.register(ticketingRoutes, { prefix: '/ticketing' });
         }, { prefix: '/api/v1/dashboard' });
 
         // 8. Graceful Shutdown Handlers

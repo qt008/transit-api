@@ -21,6 +21,14 @@ export interface IUser extends Document {
     mfaEnabled: boolean;
     mfaSecret?: string;
     walletAccountId: string; // Link to Domain B
+
+    // Branch Access
+    primaryBranchId?: string;
+    branchIds: string[]; // IDs of branches this user can access
+
+    // Status
+    isActive?: boolean;
+    deactivatedAt?: Date;
 }
 
 const UserSchema = new Schema<IUser>(
@@ -39,7 +47,15 @@ const UserSchema = new Schema<IUser>(
         },
         mfaEnabled: { type: Boolean, default: false },
         mfaSecret: { type: String, select: false },
-        walletAccountId: { type: String, required: true }
+        walletAccountId: { type: String, required: true },
+
+        // Branch Access
+        primaryBranchId: { type: String, index: true },
+        branchIds: { type: [String], default: [] },
+
+        // Status
+        isActive: { type: Boolean, default: true },
+        deactivatedAt: { type: Date }
     },
     { timestamps: true }
 );

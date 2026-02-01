@@ -1,4 +1,4 @@
-import { Schema, model, Document } from 'mongoose';
+import mongoose, { Schema, model, Document } from 'mongoose';
 
 export enum DriverStatus {
     ACTIVE = 'ACTIVE',
@@ -37,4 +37,5 @@ const DriverSchema = new Schema({
     timestamps: true
 });
 
-export const DriverModel = model<IDriver>('Driver', DriverSchema);
+// @ts-ignore
+export const DriverModel = (mongoose.models.Driver as mongoose.Model<IDriver>) || model<IDriver>('Driver', DriverSchema);

@@ -2,6 +2,7 @@ import { FastifyRequest, FastifyReply } from 'fastify';
 import { TripModel, TripStatus } from '../models/trip.model';
 import { VehicleModel, VehicleStatus } from '../models/vehicle.model';
 import { DriverModel, DriverStatus } from '../../identity/models/driver.model';
+import { TripService } from '../services/trip.service';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 
@@ -30,9 +31,9 @@ export class TripController {
 
             if (!vehicle) throw new Error('Vehicle not found');
             if (!driver) throw new Error('Driver not found');
-            if (vehicle.status === VehicleStatus.ON_TRIP) {
-                throw new Error('Vehicle already on trip');
-            }
+            // if (vehicle.status === VehicleStatus.ON_TRIP) {
+            //     throw new Error('Vehicle already on trip');
+            // }
             if (driver.status === DriverStatus.ON_TRIP) {
                 throw new Error('Driver already on trip');
             }
@@ -46,17 +47,11 @@ export class TripController {
                 currentStopIndex: 0
             });
 
-            // Update vehicle and driver status
-            await Promise.all([
-                VehicleModel.updateOne(
-                    { vehicleId: body.vehicleId },
-                    { status: VehicleStatus.ON_TRIP }
-                ),
-                DriverModel.updateOne(
-                    { driverId: body.driverId },
-                    { status: DriverStatus.ON_TRIP }
-                )
-            ]);
+            // Update driver status (vehicle status update removed)
+            await DriverModel.updateOne(
+                { driverId: body.driverId },
+                { status: DriverStatus.ON_TRIP }
+            );
 
             return reply.status(201).send({
                 success: true,
@@ -101,7 +96,7 @@ export class TripController {
             if (!trip) throw new Error('Trip not found');
 
             trip.status = TripStatus.COMPLETED;
-            trip.arrivalTime = new Date();
+            trip.actualArrivalTime = new Date();
             await trip.save();
 
             // Free up vehicle and driver
@@ -148,5 +143,114 @@ export class TripController {
             .limit(20);
 
         return reply.send({ success: true, data: trips });
+    }
+
+    /**
+     * POST /trips/generate - Generate trips from schedule
+     */
+    static async generateTrips(req: FastifyRequest, reply: FastifyReply) {
+        const { scheduleId, startDate, endDate } = z.object({
+            scheduleId: z.string(),
+            startDate: z.string(),
+            endDate: z.string()
+        }).parse(req.body);
+
+        // @ts-ignore
+        const { userId } = req.user || {};
+
+        try {
+            const trips = await TripService.generateTripsFromSchedule(
+                scheduleId,
+                new Date(startDate),
+                new Date(endDate),
+                userId || 'SYSTEM'
+            );
+
+            return reply.status(201).send({
+                success: true,
+                message: `Generated ${trips.length} trip(s)`,
+                data: trips
+            });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * GET /trips - List trips with filters
+     */
+    static async list(req: FastifyRequest, reply: FastifyReply) {
+        const query = req.query as any;
+
+        try {
+            const trips = await TripService.getTrips({
+                routeId: query.routeId,
+                branchId: query.branchId,
+                vehicleId: query.vehicleId,
+                driverId: query.driverId,
+                startDate: query.startDate ? new Date(query.startDate) : undefined,
+                endDate: query.endDate ? (() => {
+                    const d = new Date(query.endDate);
+                    d.setHours(23, 59, 59, 999);
+                    return d;
+                })() : undefined,
+                status: query.status
+            });
+
+            return reply.send({ success: true, data: trips, count: trips.length });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * GET /trips/:id - Get trip details
+     */
+    static async getById(req: FastifyRequest, reply: FastifyReply) {
+        const { id } = req.params as { id: string };
+
+        try {
+            const trip = await TripModel.findOne({ tripId: id });
+            if (!trip) {
+                return reply.status(404).send({ error: 'Trip not found' });
+            }
+
+            return reply.send({ success: true, data: trip });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * GET /trips/:id/availability - Get seat availability
+     */
+    static async getAvailability(req: FastifyRequest, reply: FastifyReply) {
+        const { id } = req.params as { id: string };
+
+        try {
+            const availability = await TripService.getTripAvailability(id);
+            return reply.send({ success: true, data: availability });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * PATCH /trips/:id/status - Update trip status
+     */
+    static async updateStatus(req: FastifyRequest, reply: FastifyReply) {
+        const { id } = req.params as { id: string };
+        const { status } = z.object({ status: z.nativeEnum(TripStatus) }).parse(req.body);
+
+        try {
+            const trip = await TripService.updateTripStatus(id, status);
+            return reply.send({
+                success: true,
+                message: 'Trip status updated',
+                data: trip
+            });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
     }
 }
