@@ -5,7 +5,8 @@ export class FleetConfigController {
     // Get config (create default if not exists)
     static async getConfig(req: FastifyRequest, reply: FastifyReply) {
         try {
-            const tenantId = 'TENANT-DEFAULT'; // TODO: Get from auth
+            const tenantId = req.user?.tenantId;
+            if (!tenantId) return reply.status(401).send({ error: 'Unauthorized' });
             let config = await FleetConfigModel.findOne({ tenantId });
 
             if (!config) {
@@ -31,10 +32,12 @@ export class FleetConfigController {
     }
 
     // Update config
-    static async updateConfig(req: FastifyRequest<{ Body: Partial<IFleetConfig> }>, reply: FastifyReply) {
+    static async updateConfig(req: FastifyRequest, reply: FastifyReply) {
         try {
-            const tenantId = 'TENANT-DEFAULT'; // TODO: Get from auth
-            const updates = req.body;
+            const tenantId = req.user?.tenantId;
+            if (!tenantId) return reply.status(401).send({ error: 'Unauthorized' });
+
+            const updates = req.body as Partial<IFleetConfig>;
 
             const config = await FleetConfigModel.findOneAndUpdate(
                 { tenantId },

@@ -42,22 +42,32 @@ const start = async () => {
             contentSecurityPolicy: {
                 directives: {
                     defaultSrc: ["'self'"],
-                    styleSrc: ["'self'", "'unsafe-inline'"],
-                    scriptSrc: ["'self'"],
-                    imgSrc: ["'self'", 'data:', 'https:']
+                    styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+                    scriptSrc: ["'self'"], // Removed 'unsafe-inline' (React scripts should stand alone)
+                    imgSrc: ["'self'", 'data:', 'https:', 'blob:'],
+                    fontSrc: ["'self'", "https://fonts.gstatic.com"],
+                    connectSrc: ["'self'", env.CORS_ORIGIN === '*' ? '*' : env.CORS_ORIGIN.split(',')[0]]
                 }
             }
         });
 
         await app.register(cors, {
-            origin: env.CORS_ORIGIN === '*' ? true : env.CORS_ORIGIN.split(','),
+            origin: (origin, cb) => {
+                const allowedOrigins = env.CORS_ORIGIN === '*' ? '*' : env.CORS_ORIGIN.split(',');
+                if (allowedOrigins === '*' || !origin || allowedOrigins.includes(origin)) {
+                    cb(null, true);
+                    return;
+                }
+                cb(new Error("Not allowed by CORS"), false);
+            },
             credentials: true,
-            methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
+            methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']
         });
 
         await app.register(rateLimit, {
-            max: 100,
+            max: 300, // Global limit
             timeWindow: '1 minute',
+            allowList: ['127.0.0.1'], // Allow local dev
             errorResponseBuilder: () => ({
                 success: false,
                 error: {

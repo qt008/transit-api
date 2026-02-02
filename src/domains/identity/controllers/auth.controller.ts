@@ -12,8 +12,7 @@ const RegisterSchema = z.object({
     password: z.string().min(6),
     firstName: z.string(),
     lastName: z.string(),
-    role: z.nativeEnum(Role).optional(),
-    tenantName: z.string().optional()
+    // role and tenantName removed to prevent Privilege Escalation via mass assignment
 });
 
 const LoginSchema = z.object({
@@ -24,15 +23,23 @@ const LoginSchema = z.object({
 export class AuthController {
 
     static async register(req: FastifyRequest, reply: FastifyReply) {
-        const body = RegisterSchema.parse(req.body);
+        // Explicitly only allow safe fields. Ignore 'role' and 'tenantName' from input to prevent privilege escalation.
+        const { phone, password, firstName, lastName } = RegisterSchema.parse(req.body);
 
         try {
-            const user = await authService.registerUser(body);
+            // Force role to PASSENGER for public registration
+            const user = await authService.registerUser({
+                phone,
+                password,
+                firstName,
+                lastName,
+                role: Role.PASSENGER
+            });
 
             // Audit logging
             AuditLogger.logAuth(AuditAction.USER_REGISTERED, user.userId, true, {
-                phone: body.phone,
-                role: body.role,
+                phone,
+                role: Role.PASSENGER,
                 ipAddress: req.ip
             });
 
@@ -45,7 +52,7 @@ export class AuthController {
             });
         } catch (err: any) {
             AuditLogger.logAuth(AuditAction.USER_REGISTERED, 'unknown', false, {
-                phone: body.phone,
+                phone,
                 error: err.message
             });
             return reply.status(400).send({ error: err.message });

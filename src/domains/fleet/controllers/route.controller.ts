@@ -83,6 +83,78 @@ export class RouteController {
         return processedStops.sort((a, b) => a.sequence - b.sequence);
     }
 
+
+    /**
+     * Helper to construct route geometry from origin -> stops -> destination
+     */
+    private static async buildRouteGeometry(
+        originBranchId: string,
+        destinationBranchId: string,
+        stops: RouteStop[],
+        explicitGeometry: number[][] | undefined,
+        tenantId: string
+    ): Promise<{ type: string; coordinates: number[][] }> {
+        // 1. Use explicit geometry if valid (>= 2 points)
+        if (explicitGeometry && explicitGeometry.length >= 2) {
+            return {
+                type: 'LineString',
+                coordinates: explicitGeometry
+            };
+        }
+
+        // 2. Construct from branches and stops
+        let pathCoordinates: number[][] = [];
+        try {
+            const [originBranch, destBranch] = await Promise.all([
+                BranchService.getBranchById(originBranchId, tenantId),
+                BranchService.getBranchById(destinationBranchId, tenantId)
+            ]);
+
+            // Add Origin
+            if (originBranch?.coordinates?.coordinates) {
+                pathCoordinates.push(originBranch.coordinates.coordinates);
+            } else {
+                pathCoordinates.push([0, 0]); // Fallback
+            }
+
+            // Add Intermediate Stops
+            if (stops && stops.length > 0) {
+                stops.forEach(stop => {
+                    if (stop.location?.coordinates) {
+                        pathCoordinates.push(stop.location.coordinates);
+                    }
+                });
+            }
+
+            // Add Destination
+            if (destBranch?.coordinates?.coordinates) {
+                pathCoordinates.push(destBranch.coordinates.coordinates);
+            } else {
+                pathCoordinates.push([0, 0]); // Fallback
+            }
+
+        } catch (e) {
+            console.error("Failed to construct geometry from branches", e);
+            // Fallback to simple line
+            return { type: 'LineString', coordinates: [[0, 0], [0, 0]] };
+        }
+
+        // 3. Ensure validity (>= 2 points)
+        if (pathCoordinates.length < 2) {
+            // If we have 1 point (e.g. same origin/dest and no stops), add a slight offset or duplicate to make it valid
+            if (pathCoordinates.length === 1) {
+                pathCoordinates.push(pathCoordinates[0]);
+            } else {
+                return { type: 'LineString', coordinates: [[0, 0], [0, 0]] };
+            }
+        }
+
+        return {
+            type: 'LineString',
+            coordinates: pathCoordinates
+        };
+    }
+
     /**
      * POST /routes - Create route
      */
@@ -97,50 +169,13 @@ export class RouteController {
                 stops = await RouteController.populateStopCoordinates(body.stops, tenantId);
             }
 
-            // Fetch Origin and Destination Branches to construct geometry
-            let pathCoordinates: number[][] = [];
-
-            // Try to get explicit geometry first
-            if (body.geometry?.coordinates && body.geometry.coordinates.length > 0) {
-                pathCoordinates = body.geometry.coordinates;
-            } else {
-                // Construct from branches
-                try {
-                    const [originBranch, destBranch] = await Promise.all([
-                        BranchService.getBranchById(body.originBranchId, tenantId),
-                        BranchService.getBranchById(body.destinationBranchId, tenantId)
-                    ]);
-
-                    if (originBranch?.coordinates?.coordinates) {
-                        pathCoordinates.push(originBranch.coordinates.coordinates);
-                    } else {
-                        pathCoordinates.push([0, 0]); // Fallback
-                    }
-
-                    // Add intermediate stops
-                    stops.forEach(stop => {
-                        if (stop.location?.coordinates) {
-                            pathCoordinates.push(stop.location.coordinates);
-                        }
-                    });
-
-                    if (destBranch?.coordinates?.coordinates) {
-                        pathCoordinates.push(destBranch.coordinates.coordinates);
-                    } else {
-                        pathCoordinates.push([0, 0]); // Fallback
-                    }
-                } catch (e) {
-                    console.error("Failed to construct geometry from branches", e);
-                    // Fallback to simple line
-                    pathCoordinates = [[0, 0], [0, 0]];
-                }
-            }
-
-            // Ensure we have at least 2 points for LineString
-            if (pathCoordinates.length < 2) {
-                pathCoordinates = [[0, 0], [0, 0]];
-            }
-
+            const geometry = await RouteController.buildRouteGeometry(
+                body.originBranchId,
+                body.destinationBranchId,
+                stops,
+                body.geometry?.coordinates,
+                tenantId
+            );
 
             const route = await RouteModel.create({
                 routeId: `ROUTE-${randomUUID()}`,
@@ -151,10 +186,7 @@ export class RouteController {
                 isActive: body.isActive ?? true,
                 basePrice: body.basePrice,
                 estimatedDuration: body.estimatedDuration,
-                geometry: {
-                    type: 'LineString',
-                    coordinates: pathCoordinates
-                },
+                geometry: geometry, // Use robust geometry
                 stops: stops,
                 accessControl: {
                     allowedRoles: ['PASSENGER'], // Default: passengers only
@@ -246,6 +278,36 @@ export class RouteController {
         if (updates.stops) {
             updates.stops = await RouteController.populateStopCoordinates(updates.stops, tenantId);
         }
+
+        // Fetch current route to check for changes if not provided in updates
+        const currentRoute = await RouteModel.findOne({ routeId: id });
+        if (!currentRoute) return reply.status(404).send({ error: 'Route not found' });
+
+        // Check if we need to rebuild geometry
+        // We rebuild if stops, origin, destination, or geometry is explicitly updated
+        const originId = updates.originBranchId || currentRoute.originBranchId;
+        const destId = updates.destinationBranchId || currentRoute.destinationBranchId;
+        const stopsToUse = updates.stops || currentRoute.stops;
+
+        // If explicit geometry is invalid (e.g. coming from frontend as [0,0]), force rebuild
+        // The frontend sends coordinates: [[0,0]] when it doesn't know the path.
+        // We treat <= 1 point or [0,0] as invalid explicit geometry.
+        let explicitGeo = updates.geometry?.coordinates;
+        const isExplicitInvalid = !explicitGeo || explicitGeo.length < 2 || (explicitGeo.length === 1 && explicitGeo[0][0] === 0);
+
+        if (isExplicitInvalid) {
+            explicitGeo = undefined; // Ignore invalid input from frontend
+        }
+
+        const geometry = await RouteController.buildRouteGeometry(
+            originId,
+            destId,
+            stopsToUse,
+            explicitGeo,
+            tenantId
+        );
+
+        updates.geometry = geometry;
 
         const route = await RouteModel.findOneAndUpdate(
             { routeId: id },

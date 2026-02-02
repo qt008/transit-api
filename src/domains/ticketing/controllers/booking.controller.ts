@@ -13,7 +13,9 @@ const CreateBookingSchema = z.object({
     passengerPhone: z.string(),
     passengerEmail: z.string().email().optional(),
     passengerIdNumber: z.string().optional(),
-    discount: z.number().optional()
+    discount: z.number().optional(),
+    paymentMethod: z.enum(['CASH', 'CARD', 'MOBILE_MONEY']).optional(), // New field for POS choice
+    paymentReference: z.string().nullable().optional() // Make optional/nullable for Cash
 });
 
 const ProcessPaymentSchema = z.object({
@@ -210,11 +212,101 @@ export class BookingController {
 
             const booking = await BookingService.createBooking(input);
 
+            if (body.paymentMethod === PaymentMethod.MOBILE_MONEY) {
+                const provider = body.paymentReference || 'MTN_MOMO_GHA';
+                const phone = body.passengerPhone;
+
+                try {
+                    const result = await BookingService.initiateMobileMoneyPayment(booking.bookingId, phone, provider);
+
+                    // We need to ensure the booking object has the method set
+                    booking.paymentMethod = PaymentMethod.MOBILE_MONEY;
+                    await booking.save();
+
+                    return reply.status(201).send({
+                        success: true,
+                        message: 'Payment prompt sent to user phone',
+                        data: booking,
+                        paymentStatus: 'PENDING_AUTHORIZATION'
+                    });
+                } catch (payErr: any) {
+                    console.error('Payment initiation failed:', payErr);
+                    return reply.status(201).send({
+                        success: true,
+                        message: 'Booking created but payment failed: ' + payErr.message,
+                        data: booking,
+                        paymentStatus: 'FAILED'
+                    });
+                }
+            }
+
+            // Auto-process CASH payment for POS bookings
+            const { booking: paidBooking } = await BookingService.processPayment(
+                booking.bookingId,
+                PaymentMethod.CASH,
+                `POS-${booking.bookingId}`
+            );
+
             return reply.status(201).send({
                 success: true,
                 message: 'POS booking created successfully',
-                data: booking
+                data: paidBooking
             });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * POST /bookings/:id/retry-payment - Retry Mobile Money Payment
+     */
+    static async retryPayment(req: FastifyRequest, reply: FastifyReply) {
+        const { id } = req.params as { id: string };
+        const body = ProcessPaymentSchema.parse(req.body); // Reuse ProcessPaymentSchema if it has method/ref
+
+        // Schema validation note: ProcessPaymentSchema requires paymentMethod.
+        // If the user sends "MOBILE_MONEY" and "paymentReference" (provider), we can reuse it.
+
+        try {
+            if (body.paymentMethod === PaymentMethod.MOBILE_MONEY) {
+                // If retrying, we might need the phone number again.
+                // If checking out existing booking, we use passengerPhone?
+                // Or does the schema support passing a phone number?
+                // ProcessPaymentSchema currently only has method and ref.
+                // We might need to fetch the booking to get the phone number if not provided.
+
+                const booking = await BookingService.getBookingById(id);
+                if (!booking) return reply.status(404).send({ error: 'Booking not found' });
+
+                const provider = body.paymentReference || 'MTN_MOMO_GHA';
+                // Use existing passenger phone
+                const phone = booking.passengerPhone;
+
+                const result = await BookingService.initiateMobileMoneyPayment(id, phone, provider);
+
+                return reply.send({
+                    success: true,
+                    message: 'Payment prompt resent',
+                    data: result
+                });
+            }
+
+            // If retrying with CASH, just mark as paid?
+            if (body.paymentMethod === PaymentMethod.CASH) {
+                const result = await BookingService.processPayment(
+                    id,
+                    PaymentMethod.CASH,
+                    `RETRY-${id}`
+                );
+                return reply.send({
+                    success: true,
+                    message: 'Payment processed (Cash)',
+                    data: result
+                });
+            }
+
+            return reply.status(400).send({ error: 'Unsupported payment method for retry' });
+
         } catch (err: any) {
             return reply.status(400).send({ error: err.message });
         }

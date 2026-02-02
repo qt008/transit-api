@@ -3,6 +3,7 @@ import { ScheduleModel } from '../models/schedule.model';
 import { RouteModel } from '../models/route.model';
 import { VehicleModel } from '../models/vehicle.model';
 import { v4 as uuidv4 } from 'uuid';
+import mongoose, { ClientSession } from 'mongoose';
 
 export class TripService {
     /**
@@ -102,7 +103,7 @@ export class TripService {
     /**
      * Book a seat on a trip (atomic operation)
      */
-    static async bookSeat(tripId: string, seatNumber: string): Promise<boolean> {
+    static async bookSeat(tripId: string, seatNumber: string, session?: ClientSession): Promise<boolean> {
         const result = await TripModel.updateOne(
             {
                 tripId,
@@ -112,7 +113,8 @@ export class TripService {
             {
                 $inc: { availableSeats: -1, passengers: 1 },
                 $push: { bookedSeats: seatNumber }
-            }
+            },
+            { session }
         );
 
         return result.modifiedCount > 0;
@@ -121,7 +123,7 @@ export class TripService {
     /**
      * Release a seat (for cancellations)
      */
-    static async releaseSeat(tripId: string, seatNumber: string): Promise<boolean> {
+    static async releaseSeat(tripId: string, seatNumber: string, session?: ClientSession): Promise<boolean> {
         const result = await TripModel.updateOne(
             {
                 tripId,
@@ -130,7 +132,8 @@ export class TripService {
             {
                 $inc: { availableSeats: 1, passengers: -1 },
                 $pull: { bookedSeats: seatNumber }
-            }
+            },
+            { session }
         );
 
         return result.modifiedCount > 0;
@@ -139,10 +142,11 @@ export class TripService {
     /**
      * Update trip revenue
      */
-    static async addRevenue(tripId: string, amount: number): Promise<void> {
+    static async addRevenue(tripId: string, amount: number, session?: ClientSession): Promise<void> {
         await TripModel.updateOne(
             { tripId },
-            { $inc: { revenue: amount } }
+            { $inc: { revenue: amount } },
+            { session }
         );
     }
 
@@ -174,9 +178,13 @@ export class TripService {
             if (filters.endDate) {
                 query.scheduledDepartureDate.$lte = filters.endDate;
             }
+        } else if (!filters.startDate && !filters.endDate && filters.status !== TripStatus.COMPLETED) {
+            // Default: Only show future trips or trips from today onwards
+            // Unless specifically asking for COMPLETED or providing a date range
+            query.scheduledDepartureDate = { $gte: new Date(new Date().setHours(0, 0, 0, 0)) };
         }
 
-        return TripModel.aggregate([
+        const trips = await TripModel.aggregate([
             { $match: query },
             {
                 $lookup: {
@@ -207,6 +215,45 @@ export class TripService {
             { $unwind: { path: '$driver', preserveNullAndEmptyArrays: true } },
             { $sort: { scheduledDepartureDate: 1, scheduledDepartureTime: 1 } }
         ]);
+
+        // Filter out past trips (Time-based check for Today)
+        // If status is specific (e.g. searching for COMPLETED), skip this.
+        // If status is not provided or is SCHEDULED/IN_PROGRESS/DELAYED, we might want to filter?
+        // Actually, user request: "on clicking the POS booking, no trips should even be populated if they do not match teh availability criteria"
+        // This implies availability search.
+        // If we are just listing trips for Admin (e.g. Schedule Page), we might want to see them all?
+        // But this function is general.
+        // Let's assume if status is NOT 'COMPLETED' and NOT 'CANCELLED', and we are looking at today, we filter time.
+
+        if (filters.status !== TripStatus.COMPLETED && filters.status !== TripStatus.CANCELLED) {
+            const now = new Date();
+            const todayStart = new Date();
+            todayStart.setHours(0, 0, 0, 0);
+
+            return trips.filter(trip => {
+                const tripDate = new Date(trip.scheduledDepartureDate);
+                // If trip is in the past (before today), filter out (though query usually handles this if default)
+                if (tripDate < todayStart) return false;
+
+                // If trip is strictly in future (> today), keep
+                if (tripDate > todayStart) return true;
+
+                // If trip is TODAY, check time
+                if (tripDate.getTime() === todayStart.getTime()) {
+                    const [hours, minutes] = (trip.scheduledDepartureTime || '00:00').split(':').map(Number);
+                    const tripTime = new Date(tripDate);
+                    tripTime.setHours(hours, minutes, 0, 0);
+
+                    // Allow seeing trip if it is within last 15 mins? No, strict "if time is past".
+                    // Maybe give 5 mins grace for "just missed"? User said "if trip time is past... no trips".
+                    return tripTime > now;
+                }
+
+                return true; // Should not reach here if logic covers < > =
+            });
+        }
+
+        return trips;
     }
 
     /**

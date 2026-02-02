@@ -10,6 +10,7 @@ export async function ticketingRoutes(fastify: FastifyInstance) {
     fastify.get('/bookings', { preHandler: [fastify.authenticate] }, BookingController.list);
     fastify.get('/bookings/:id', { preHandler: [fastify.authenticate] }, BookingController.getById);
     fastify.post('/bookings/:id/pay', { preHandler: [fastify.authenticate] }, BookingController.processPayment);
+    fastify.post('/bookings/:id/retry-payment', BookingController.retryPayment); // New endpoint
     fastify.post('/bookings/:id/cancel', { preHandler: [fastify.authenticate] }, BookingController.cancel);
     fastify.post('/bookings/:id/check-in', { preHandler: [fastify.authenticate] }, BookingController.checkIn);
 

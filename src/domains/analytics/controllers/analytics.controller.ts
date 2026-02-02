@@ -12,10 +12,18 @@ export class AnalyticsController {
     static async getRevenue(req: FastifyRequest, reply: FastifyReply) {
         const { startDate, endDate, operatorId } = req.query as any;
 
+        const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        const end = endDate ? new Date(endDate) : new Date();
+
+        // Ensure end date includes the full day (set to 23:59:59.999 UTC)
+        if (endDate) {
+            end.setUTCHours(23, 59, 59, 999);
+        }
+
         const filter: any = {
             createdAt: {
-                $gte: new Date(startDate || Date.now() - 30 * 24 * 60 * 60 * 1000),
-                $lte: new Date(endDate || Date.now())
+                $gte: start,
+                $lte: end
             }
         };
 
@@ -23,24 +31,50 @@ export class AnalyticsController {
             filter['metadata.operatorId'] = operatorId;
         }
 
-        const transactions = await LedgerEntryModel.aggregate([
+        const stats = await LedgerEntryModel.aggregate([
             { $match: filter },
             {
-                $group: {
-                    _id: null,
-                    totalRevenue: { $sum: '$amount' },
-                    transactionCount: { $sum: 1 }
+                $facet: {
+                    // Total summary
+                    summary: [
+                        {
+                            $group: {
+                                _id: null,
+                                totalRevenue: { $sum: { $multiply: ['$amount', 0.01] } },
+                                transactionCount: { $sum: 1 }
+                            }
+                        }
+                    ],
+                    // Daily breakdown for charts
+                    breakdown: [
+                        {
+                            $group: {
+                                _id: {
+                                    $dateToString: { format: '%Y-%m-%d', date: '$createdAt' }
+                                },
+                                dailyRevenue: { $sum: { $multiply: ['$amount', 0.01] } },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { _id: 1 } } // Sort by date ascending
+                    ]
                 }
             }
         ]);
 
-        const result = transactions[0] || { totalRevenue: 0, transactionCount: 0 };
+        const summary = stats[0].summary[0] || { totalRevenue: 0, transactionCount: 0 };
+        const breakdown = stats[0].breakdown || [];
 
         return reply.send({
             success: true,
             data: {
-                totalRevenue: result.totalRevenue,
-                transactionCount: result.transactionCount,
+                totalRevenue: summary.totalRevenue,
+                transactionCount: summary.transactionCount,
+                breakdown: breakdown.map((b: any) => ({
+                    date: b._id,
+                    revenue: b.dailyRevenue,
+                    count: b.count
+                })),
                 period: {
                     start: filter.createdAt.$gte,
                     end: filter.createdAt.$lte
@@ -144,7 +178,7 @@ export class AnalyticsController {
                 $group: {
                     _id: '$driverId',
                     totalTrips: { $sum: 1 },
-                    totalRevenue: { $sum: '$revenue' },
+                    totalRevenue: { $sum: { $multiply: ['$revenue', 0.01] } },
                     totalPassengers: { $sum: '$passengers' },
                     avgPassengers: { $avg: '$passengers' }
                 }
@@ -162,5 +196,71 @@ export class AnalyticsController {
             success: true,
             data: result
         });
+    }
+    /**
+     * GET /analytics/recent-activity?limit=10
+     */
+    static async getRecentActivity(req: FastifyRequest, reply: FastifyReply) {
+        // @ts-ignore
+        const { tenantId } = req.user || {};
+        const { limit = 5 } = req.query as any;
+
+        try {
+            const queryLimit = Number(limit);
+
+            // 1. Fetch recent bookings
+            // We need to import BookingModel. Lazy import or assume it's available?
+            // Better to import it at the top. But since I can't easily add top imports in this block, 
+            // I'll use lazy import for this specific controller method modification pattern 
+            // OR I'll use the existing imports if I can see them.
+            // I see TripModel is imported. BookingModel is NOT imported in the file view I saw earlier.
+            // So I will use lazy import.
+            const { BookingModel } = await import('../../ticketing/models/booking.model');
+
+            const recentBookings = await BookingModel.find(tenantId ? { tenantId } : {})
+                .sort({ createdAt: -1 })
+                .limit(queryLimit)
+                .populate('tripId', 'routeId') // Get route info
+                .lean();
+
+            // 2. Fetch recent trips (Created or Completed)
+            const recentTrips = await TripModel.find(tenantId ? { tenantId } : {})
+                .sort({ createdAt: -1 })
+                .limit(queryLimit)
+                .lean();
+
+            // 3. Normalize and Merge
+            const activities = [
+                ...recentBookings.map((b: any) => ({
+                    id: b.bookingId,
+                    type: 'BOOKING',
+                    action: 'New Booking',
+                    description: `${b.passengerName} booked seat ${b.seatNumber}`,
+                    time: b.createdAt,
+                    metadata: { routeId: b.tripId?.routeId, amount: (b.totalAmount || 0) / 100 }
+                })),
+                ...recentTrips.map((t: any) => ({
+                    id: t.tripId,
+                    type: 'TRIP',
+                    action: `Trip ${t.status}`, // e.g., Trip SCHEDULED, Trip COMPLETED
+                    description: `Route: ${t.routeId} • Bus: ${t.vehicleId}`,
+                    time: t.createdAt, // Or updatedAt for status changes? sticking to createdAt for simplicity of "New things"
+                    metadata: { status: t.status }
+                }))
+            ];
+
+            // 4. Sort combined list and slice
+            const sortedActivity = activities
+                .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
+                .slice(0, queryLimit);
+
+            return reply.send({
+                success: true,
+                data: sortedActivity
+            });
+        } catch (err: any) {
+            console.error('Recent Activity Error:', err);
+            return reply.status(500).send({ error: 'Failed to fetch activity' });
+        }
     }
 }

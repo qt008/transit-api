@@ -9,6 +9,8 @@ import { ScheduleController } from './controllers/schedule.controller';
 import { TripController } from './controllers/trip.controller';
 import { RatingController } from './controllers/rating.controller';
 import { FleetConfigController } from './controllers/fleet-config.controller';
+import { MaintenanceController } from './controllers/maintenance.controller';
+import { AssignmentController } from './controllers/assignment.controller';
 import { branchRoutes } from './branch.routes';
 
 export async function fleetRoutes(fastify: FastifyInstance) {
@@ -27,8 +29,20 @@ export async function fleetRoutes(fastify: FastifyInstance) {
     fastify.post('/vehicles/:id/documents', { preHandler: [fastify.authenticate] }, VehicleController.addDocument);
     fastify.patch('/vehicles/:id/seats', { preHandler: [fastify.authenticate] }, VehicleController.updateSeat);
 
-    fastify.post('/vehicles/:id/assign-routes', VehicleController.assignRoutes);
-    fastify.post('/vehicles/:id/transition-route', VehicleController.transitionRoute);
+    fastify.post('/vehicles/:id/assign-routes', { preHandler: [fastify.authenticate] }, VehicleController.assignRoutes);
+    fastify.post('/vehicles/:id/transition-route', { preHandler: [fastify.authenticate] }, VehicleController.transitionRoute);
+
+    // Vehicle Assignment
+    fastify.post('/vehicles/assign', { preHandler: [fastify.authenticate] }, AssignmentController.assign);
+    fastify.post('/vehicles/return/:id', { preHandler: [fastify.authenticate] }, AssignmentController.returnVehicle);
+    fastify.get('/vehicles/assignment-history', { preHandler: [fastify.authenticate] }, AssignmentController.getHistory);
+
+    // Maintenance Management
+    fastify.post('/maintenance', { preHandler: [fastify.authenticate] }, MaintenanceController.create);
+    fastify.get('/maintenance', { preHandler: [fastify.authenticate] }, MaintenanceController.list);
+    fastify.get('/maintenance/stats', { preHandler: [fastify.authenticate] }, MaintenanceController.getStats);
+    fastify.patch('/maintenance/:id', { preHandler: [fastify.authenticate] }, MaintenanceController.update);
+
 
     // Driver Management
     fastify.post('/drivers', { preHandler: [fastify.authenticate] }, DriverController.create);
@@ -36,7 +50,6 @@ export async function fleetRoutes(fastify: FastifyInstance) {
     fastify.get('/drivers/:id', { preHandler: [fastify.authenticate] }, DriverController.getById);
     fastify.patch('/drivers/:id', { preHandler: [fastify.authenticate] }, DriverController.update);
     fastify.post('/drivers/:id/documents', { preHandler: [fastify.authenticate] }, DriverController.addDocument);
-    fastify.post('/drivers/:id/assign-vehicle', { preHandler: [fastify.authenticate] }, DriverController.assignVehicle);
 
     // Fuel Tracking
     fastify.post('/fuel-logs', { preHandler: [fastify.authenticate] }, FuelLogController.create);
@@ -90,7 +103,7 @@ export async function fleetRoutes(fastify: FastifyInstance) {
 
     // Fleet Configuration
     fastify.get('/config', { preHandler: [fastify.authenticate] }, FleetConfigController.getConfig);
-    fastify.patch('/config', { preHandler: [fastify.authenticate] }, FleetConfigController.updateConfig as any);
+    fastify.patch('/config', { preHandler: [fastify.authenticate] }, FleetConfigController.updateConfig);
 
     // Branch Management
     fastify.register(branchRoutes, { prefix: '/branches' });

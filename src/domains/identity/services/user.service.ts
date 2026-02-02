@@ -56,8 +56,12 @@ export class UserService {
 
         // Determine tenant
         let tenantId = userData.tenantId;
+
+        // If creator is not Super Admin, force usage of their tenant ID
         if (creatorRole !== Role.SUPER_ADMIN) {
-            // Non-super-admins can only create users in their own tenant
+            tenantId = creatorUser.tenantId;
+        } else if (!tenantId) {
+            // If Super Admin and no tenantId provided, default to their own tenant
             tenantId = creatorUser.tenantId;
         }
 
@@ -211,8 +215,14 @@ export class UserService {
 
         // Non-super-admins can only see users in their tenant
         if (requesterRole !== Role.SUPER_ADMIN) {
+            // Safety: Ensure tenantId exists on requester
+            if (!requesterUser.tenantId) {
+                // Should not happen for valid non-admin users, but if it does, return empty to avoid leak
+                return { data: [], pagination: { page: 1, limit: 20, total: 0, pages: 0 } };
+            }
             query.tenantId = requesterUser.tenantId;
         } else if (filters.tenantId) {
+            // Super admin filtering by specific tenant
             query.tenantId = filters.tenantId;
         }
 
@@ -231,18 +241,32 @@ export class UserService {
 
         // Search by name, email, or phone
         if (filters.search) {
-            const searchRegex = new RegExp(filters.search, 'i');
-            query.$or = [
+            // Escape regex special characters to prevent errors
+            const escapedSearch = filters.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const searchRegex = new RegExp(escapedSearch, 'i');
+
+            const searchConditions = [
                 { firstName: searchRegex },
                 { lastName: searchRegex },
                 { email: searchRegex },
                 { phone: searchRegex },
             ];
+
+            // If we already have an $or (branch filter), we need to AND them
+            if (query.$or) {
+                query.$and = [
+                    { $or: query.$or },
+                    { $or: searchConditions }
+                ];
+                delete query.$or;
+            } else {
+                query.$or = searchConditions;
+            }
         }
 
         // Pagination
-        const page = filters.page || 1;
-        const limit = filters.limit || 20;
+        const page = Math.max(1, filters.page || 1);
+        const limit = Math.max(1, filters.limit || 20);
         const skip = (page - 1) * limit;
 
         const [users, total] = await Promise.all([

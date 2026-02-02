@@ -40,8 +40,10 @@ export const requireAnyRole = (roles: Role[]) => {
             return reply.code(401).send({ error: 'Authentication required' });
         }
 
-        const userRoles = user.roles || [];
-        const hasRequiredRole = roles.some(role => userRoles.includes(role));
+        console.log(user);
+
+        const userRoles = user.role || "";
+        const hasRequiredRole = roles.some(role => role === userRoles);
 
         if (!hasRequiredRole) {
             return reply.code(403).send({
@@ -64,8 +66,8 @@ export const requireAllRoles = (roles: Role[]) => {
             return reply.code(401).send({ error: 'Authentication required' });
         }
 
-        const userRoles = user.roles || [];
-        const hasAllRoles = roles.every(role => userRoles.includes(role));
+        const userRoles = user.role || "";
+        const hasAllRoles = roles.every(role => role === userRoles);
 
         if (!hasAllRoles) {
             return reply.code(403).send({
@@ -87,7 +89,7 @@ export const attachPermissions = async (req: FastifyRequest, reply: FastifyReply
         return reply.code(401).send({ error: 'Authentication required' });
     }
 
-    const userRole = user.roles?.[0] as Role;
+    const userRole = user.role || "";
     if (userRole) {
         // Attach permissions to user object for easy access
         user.permissions = getRolePermissions(userRole);

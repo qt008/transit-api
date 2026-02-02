@@ -173,27 +173,27 @@ export class UserController {
      * POST /users - Create new user (admin only)
      */
     static async createUser(req: FastifyRequest, reply: FastifyReply) {
+        console.log('[UserController.createUser] Authenticated User:', req.user); // Debug log
+        console.log('[UserController.createUser] Payload:', req.body); // Debug log
+
+        const validatedData = CreateUserSchema.parse(req.body);
+
+        // @ts-ignore
+        const creatorId = req.user.id;
+        const creatorUser = await UserModel.findOne({ userId: creatorId });
+
+        if (!creatorUser) {
+            console.error('[UserController.createUser] Creator user not found:', creatorId); // Debug log
+            return reply.status(401).send({ error: 'Unauthorized: User not found' });
+        }
+        console.log('[UserController.createUser] Creator User Role:', creatorUser.roles); // Debug log
+
         try {
-            const userData = CreateUserSchema.parse(req.body);
-            const requester = req.user as any;
-
-            const requesterUser = await UserModel.findOne({ userId: requester.id });
-            if (!requesterUser) {
-                return reply.status(404).send({ error: 'Requester not found' });
-            }
-
-            const newUser = await UserService.createUser(requesterUser, userData as CreateUserDto);
-
-            return reply.status(201).send({
-                success: true,
-                data: newUser,
-                message: 'User created successfully'
-            });
+            const user = await UserService.createUser(creatorUser, validatedData);
+            return reply.status(201).send({ success: true, data: user });
         } catch (err: any) {
-            return reply.status(400).send({
-                success: false,
-                error: err.message
-            });
+            console.error('[UserController.createUser] Error:', err); // Debug log
+            return reply.status(400).send({ error: err.message });
         }
     }
 
