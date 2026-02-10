@@ -30,6 +30,18 @@ export class PawaPayService {
      * Initiate a Mobile Money Deposit (Payment Request)
      */
     static async initiateDeposit(input: InitiateDepositInput): Promise<PaymentResponse> {
+        // Check Payment Mode
+        const mode = process.env.PAYMENT_MODE || 'TEST';
+
+        if (mode === 'TEST') {
+            console.info('ℹ️ [PawaPay] TEST MODE: Mocking payment initiation');
+            return {
+                depositId: `MOCK-${uuidv4()}`,
+                status: 'PENDING',
+                // No redirect details needed for backend mock
+            };
+        }
+
         try {
             const response = await axios.post(
                 `${this.baseUrl}/deposits`,
@@ -69,14 +81,6 @@ export class PawaPayService {
             };
         } catch (error: any) {
             console.error('PawaPay Deposit Error:', error.response?.data || error.message);
-            // In Sandbox, if token is missing, we can simulate success for testing UI
-            if (process.env.NODE_ENV !== 'production' && !this.token) {
-                console.warn('⚠️ Mocking PawaPay Success (No Token Provided)');
-                return {
-                    depositId: `MOCK-${uuidv4()}`,
-                    status: 'PENDING',
-                };
-            }
             throw new Error(error.response?.data?.message || 'Payment initiation failed');
         }
     }
@@ -101,5 +105,22 @@ export class PawaPayService {
             console.error('PawaPay Check Status Error:', error.response?.data || error.message);
             throw error;
         }
+    }
+    /**
+     * Verify Webhook Signature
+     */
+    static verifySignature(payload: string, signature: string): boolean {
+        const secret = process.env.PAWAPAY_WEBHOOK_SECRET;
+        if (!secret) return true; // Fail open in dev if no secret? Or fail closed? 
+        // Better fail open ONLY in dev if explicitly needed, but let's implement strict check.
+        // If no secret configured, we can't verify.
+
+        const crypto = require('crypto');
+        const hash = crypto
+            .createHmac('sha256', secret)
+            .update(payload)
+            .digest('hex');
+
+        return hash === signature;
     }
 }

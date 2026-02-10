@@ -36,6 +36,7 @@ export class SMSService {
             // Arkesel returns code '1000' for success
             return response.data.code === '1000';
         } catch (error: any) {
+            console.log(error);
             console.error('SMS send failed:', error.response?.data || error.message);
             throw new Error('Failed to send OTP');
         }
@@ -64,6 +65,35 @@ export class SMSService {
             return response.data.code === '1000';
         } catch (error: any) {
             console.error('SMS send failed:', error.response?.data || error.message);
+            return false;
+        }
+    }
+    /**
+     * Send Booking Confirmation SMS
+     */
+    async sendBookingConfirmation(
+        phone: string,
+        details: {
+            bookingId: string;
+            origin: string;
+            destination: string;
+            departureDate: Date;
+            departureTime: string;
+            seatNumber: string;
+        }
+    ): Promise<boolean> {
+        try {
+            // Construct tracking URL
+            const trackingUrl = `${env.WEB_APP_URL}/bookings/${details.bookingId}`;
+
+            // Format Date: "12 Feb"
+            const dateStr = details.departureDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+
+            const message = `Confirmed! Ref: ${details.bookingId}. ${details.origin}->${details.destination}. Dep: ${dateStr} ${details.departureTime}. Seat: ${details.seatNumber}. View: ${trackingUrl}`;
+
+            return await this.sendSMS(phone, message);
+        } catch (error) {
+            console.error('Failed to send booking confirmation SMS:', error);
             return false;
         }
     }

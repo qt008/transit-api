@@ -37,6 +37,8 @@ export interface CreateBookingInput {
 }
 
 import mongoose from 'mongoose';
+import { UserModel } from '../../identity/models/user.model';
+import { SMSService } from '../../../services/sms.service';
 // ... existing imports
 
 const TAX_RATE = 0.05;
@@ -49,64 +51,40 @@ export class BookingService {
         const executeBooking = async (details: { session: mongoose.ClientSession | undefined, isTransaction: boolean }) => {
             const { session, isTransaction } = details;
 
+            // 0. Verify User Exists
+            if (input.userId) { // userId should be required but input type suggests it is.
+                const userExists = await UserModel.exists({ userId: input.userId }).session(session || null);
+                if (!userExists) throw new Error('User not found');
+            }
+
             // 1. Verify trip exists and get details
             const trip = await TripModel.findOne({ tripId: input.tripId }).session(session || null);
             if (!trip) throw new Error('Trip not found');
 
-            // 1.5 Verify trip hasn't departed
+            // 1.5 Verify trip hasn't departed (Strict Date + Time Check)
             const now = new Date();
-            // Allow booking up to departure time (or maybe 5 mins before?)
-            // For now, strict check against departure time.
-            const departureTime = new Date(trip.scheduledDepartureDate);
-            // Combine date with time string if needed, but usually scheduledDepartureDate includes time in this system or we rely on full Date object.
-            // Looking at generateTrips: scheduledDepartureDate is set to new Date(currentDate) which might be 00:00?
-            // No, generateTrips sets: scheduledDepartureDate: new Date(currentDate) where currentDate has been iterated.
-            // AND scheduledDepartureTime: schedule.departureTime (string).
-            // Wait, TripModel uses scheduledDepartureDate as type Date.
-            // If the system stores just the date part in scheduledDepartureDate and time in scheduledDepartureTime string, we need to combine.
-            // Let's check TripService.generateTrips -> it sets scheduledDepartureDate using `new Date(currentDate)`.
-            // But currentDate is iterated via date increment. The time component might be 00:00 or whatever startDate had.
-            // Let's assume we need to parse time.
-            // ACTUALLY, checking standard implementation: usually scheduledDepartureDate IS the full datetime.
-            // Let's look at TripModel usage.
-            // In TripService line 55: scheduledDepartureDate: new Date(currentDate).
-            // If currentDate comes from `startDate`, it depends on input.
-            // Best safety is to combine them if strictly needed, but let's assume scheduledDepartureDate is sufficient for day check,
-            // and we might need to be careful with time.
-            // However, to be safe against "past days", checking scheduledDepartureDate < now (where now includes time) might be tricky if scheduledDepartureDate is 00:00.
-            // Let's use a robust check: if trip date < today (start of day), it's definitely past.
-            // If trip date == today, check time.
-            // But likely keeping it simple:
-            if (new Date(trip.scheduledDepartureDate) < new Date(now.getTime() - 15 * 60 * 1000)) { // Allow grace period or check strictly
-                // Actually, if a bus leaves at 8:00 AM and it's 8:01 AM, can I book? probably not.
-                // safe check:
+            const tripDate = new Date(trip.scheduledDepartureDate);
+
+            // Parse time string "HH:mm"
+            const [hours, minutes] = (trip.scheduledDepartureTime || '00:00').split(':').map(Number);
+
+            // Set time on the trip date object
+            const departureDateTime = new Date(tripDate);
+            departureDateTime.setHours(hours, minutes, 0, 0);
+
+            // Allow 5 minutes grace period? keeping it strict for now.
+            if (departureDateTime < now) {
+                // If status is COMPLETED/IN_PROGRESS, it's definitely too late
                 if (trip.status === 'COMPLETED' || trip.status === 'IN_PROGRESS') {
                     throw new Error('Trip has already departed');
                 }
 
-                // If status is SCHEDULED, we should check time.
-                // Assuming scheduledDepartureDate is the simplified date.
-                // Let's just check if the trip is in the past.
-                const tripDate = new Date(trip.scheduledDepartureDate);
-                if (tripDate < new Date()) {
-                    // This creates an issue if scheduledDepartureDate is set to midnight.
-                    // Let's verify if we need to parse time.
-                    // For now, let's block if status implies departure or if date is strictly in past (yesterday).
-                }
+                // If SCHEDULED but time passed -> Error
+                throw new Error(`Trip departed at ${trip.scheduledDepartureTime} on ${tripDate.toDateString()}`);
             }
 
-            // BETTER FIX: rely on status and basic date check.
             if (trip.status !== 'SCHEDULED' && trip.status !== 'DELAYED') {
                 throw new Error(`Cannot book trip with status: ${trip.status}`);
-            }
-
-            // Check if date is in the past (yesterday or before)
-            const tripDate = new Date(trip.scheduledDepartureDate);
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-
-            if (tripDate < today) {
-                throw new Error('Cannot book past trips');
             }
 
             // If today, check time? (Optional, maybe user wants to book last minute?)
@@ -150,9 +128,27 @@ export class BookingService {
                     throw new Error('Invalid stop or branch selection');
                 }
 
-                // 5. Create booking
+                // 5. Create booking - with Uniqueness Check
+                let bookingId = generateBookingId();
+                let isUnique = false;
+                let attempts = 0;
+
+                while (!isUnique && attempts < 5) {
+                    const existing = await BookingModel.exists({ bookingId }).session(session || null);
+                    if (!existing) {
+                        isUnique = true;
+                    } else {
+                        bookingId = generateBookingId();
+                        attempts++;
+                    }
+                }
+
+                if (!isUnique) {
+                    throw new Error('Failed to generate unique Booking ID. Please try again.');
+                }
+
                 const [booking] = await BookingModel.create([{
-                    bookingId: generateBookingId(),
+                    bookingId,
                     userId: input.userId,
                     tripId: input.tripId,
 
@@ -283,6 +279,25 @@ export class BookingService {
         // Link ticket to booking
         booking.ticketId = ticket.ticketId;
         await booking.save();
+
+        // Send Confirmation SMS (Async/Fire-and-forget)
+        try {
+            const smsService = new SMSService();
+            // Resolve stop names for SMS if possible (already in booking object!)
+            // booking.fromStopName / toStopName should be populated.
+
+            await smsService.sendBookingConfirmation(booking.passengerPhone, {
+                bookingId: booking.bookingId,
+                origin: booking.fromStopName,
+                destination: booking.toStopName,
+                departureDate: booking.scheduledDepartureDate,
+                departureTime: booking.scheduledDepartureTime,
+                seatNumber: booking.seatNumber
+            });
+        } catch (smsError) {
+            console.error('Failed to send booking confirmation SMS:', smsError);
+            // Non-blocking
+        }
 
         return { booking, ticket };
     }
@@ -481,8 +496,45 @@ export class BookingService {
     /**
      * Get booking by ID
      */
-    static async getBookingById(bookingId: string): Promise<IBooking | null> {
-        return BookingModel.findOne({ bookingId });
+    /**
+     * Get booking by ID
+     */
+    static async getBookingById(bookingId: string): Promise<any | null> {
+        const booking = await BookingModel.findOne({ bookingId }).lean();
+        if (!booking) return null;
+
+        // Fetch trip to get stop offsets
+        const trip = await TripModel.findOne({ tripId: booking.tripId }).lean();
+
+        let departureTime = booking.scheduledDepartureDate;
+        let arrivalTime = booking.scheduledDepartureDate;
+        let durationMinutes = 0;
+
+        if (trip) {
+            const fromStop = trip.stops.find(s => s.stopId === booking.fromStopId);
+            const toStop = trip.stops.find(s => s.stopId === booking.toStopId);
+
+            if (fromStop && toStop) {
+                // Determine base start time from trip
+                // Assuming scheduledDepartureDate includes the time, or we use scheduledDepartureTime to adjust
+                // For now, let's assume scheduledDepartureDate is correct base.
+                const baseTime = new Date(trip.scheduledDepartureDate).getTime();
+
+                const depOffset = (fromStop.estimatedArrivalMinutes || 0) * 60000;
+                const arrOffset = (toStop.estimatedArrivalMinutes || 0) * 60000;
+
+                departureTime = new Date(baseTime + depOffset);
+                arrivalTime = new Date(baseTime + arrOffset);
+                durationMinutes = (toStop.estimatedArrivalMinutes || 0) - (fromStop.estimatedArrivalMinutes || 0);
+            }
+        }
+
+        return {
+            ...booking,
+            passengerDepartureDate: departureTime,
+            passengerArrivalDate: arrivalTime,
+            tripDurationMinutes: durationMinutes
+        };
     }
 
     /**
@@ -496,6 +548,22 @@ export class BookingService {
         const { PawaPayService } = await import('../../payment/services/pawapay.service');
 
         try {
+            // Check Env for Test Mode
+            if (process.env.PAYMENT_MODE === 'TEST') {
+                const mockDepositId = `MOCK-${uuidv4()}`;
+                console.log(`ℹ️ [BookingService] TEST MODE: Instantly processing payment for ${bookingId}`);
+
+                // Instant mock payment
+                await BookingService.processPayment(bookingId, PaymentMethod.MOBILE_MONEY, mockDepositId);
+
+                return {
+                    success: true,
+                    message: 'Mock payment successful (Test Mode)',
+                    paymentStatus: 'PAID',
+                    depositId: mockDepositId
+                };
+            }
+
             const paymentResponse = await PawaPayService.initiateDeposit({
                 amount: (booking.totalAmount / 100).toFixed(2),
                 currency: 'GHS',
@@ -506,12 +574,8 @@ export class BookingService {
                 orderId: booking.bookingId
             });
 
-            // Update booking
+            // Update booking reference
             booking.paymentReference = paymentResponse.depositId;
-            // booking.paymentMethod = PaymentMethod.MOBILE_MONEY; // Already set ideally, but enforce it?
-            // No, let controller set it or here. catch-22 if imports are messy.
-            // We'll trust the caller set the method or we set it here.
-            // But we need the enum. Let's assume it's set.
             await booking.save();
 
             return {

@@ -43,6 +43,10 @@ export class AuthController {
                 ipAddress: req.ip
             });
 
+            // Send OTP immediately for verification
+            await authService.sendLoginOTP(user.userId, user.phone);
+
+
             return reply.status(201).send({
                 success: true,
                 data: {

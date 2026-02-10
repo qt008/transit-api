@@ -42,8 +42,16 @@ export class TripService {
                 });
 
                 if (!existingTrip) {
+                    let tripId = `TRIP-${uuidv4()}`;
+                    let isUnique = false;
+                    while (!isUnique) {
+                        const exists = await TripModel.exists({ tripId });
+                        if (!exists) isUnique = true;
+                        else tripId = `TRIP-${uuidv4()}`;
+                    }
+
                     const trip = await TripModel.create({
-                        tripId: `TRIP-${uuidv4()}`,
+                        tripId,
                         scheduleId,
                         routeId: schedule.routeId,
                         vehicleId: schedule.vehicleId,

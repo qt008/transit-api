@@ -18,6 +18,7 @@ import { errorHandler } from './shared/kernel/error.handler';
 import { requestIdMiddleware } from './shared/kernel/request-id.middleware';
 import { sanitizationMiddleware, xssProtection } from './shared/kernel/sanitization.middleware';
 import { branchRoutes } from './domains/fleet/branch.routes';
+import { webPublicRoutes } from './domains/fleet/web-public.routes';
 
 const app = fastify({
     logger: {
@@ -121,6 +122,19 @@ const start = async () => {
             dash.register(userRoutes, { prefix: '/users' });
             dash.register(ticketingRoutes, { prefix: '/ticketing' });
         }, { prefix: '/api/v1/dashboard' });
+
+        // Web BFF (/api/v1/web)
+        app.register(async (web) => {
+            web.register(webPublicRoutes, { prefix: '/public' });
+            web.register(identityRoutes, { prefix: '/auth' });
+            web.register(ticketingRoutes, { prefix: '/tickets' });
+        }, { prefix: '/api/v1/web' });
+
+        // Payment Webhooks (/api/v1/payments)
+        app.register(async (app) => {
+            const { paymentRoutes } = await import('./domains/payment/payment.routes');
+            app.register(paymentRoutes);
+        }, { prefix: '/api/v1/payments' });
 
         // 8. Graceful Shutdown Handlers
         const signals = ['SIGINT', 'SIGTERM'];

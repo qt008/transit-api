@@ -1,5 +1,6 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { BookingService, CreateBookingInput } from '../services/booking.service';
+import { AuthService } from '../../identity/services/auth.service';
 import { BookingStatus, PaymentMethod, BookingChannel } from '../models/booking.model';
 import { z } from 'zod';
 
@@ -38,14 +39,43 @@ export class BookingController {
         const roles = role ? [role] : [];
 
         try {
+            // Unified User Resolution
+            let finalUserId = userId; // From token if logged in
+
+            // If not logged in (Guest), resolve user via phone
+            if (!finalUserId) {
+                const authService = new AuthService(); // Instantiate service
+                // Use a default tenant for public web guests if tenantId is missing?
+                // Usually tenantId comes from subdomain/header. If undefined, we might have an issue.
+                // Assuming tenantId is extracted from request header in middleware even for public routes?
+                // If not, we might default to a 'ROOT' or specific tenant.
+                // For now, let's assume valid tenantId or throw.
+                if (!tenantId) {
+                    // Try to get from header directly if middleware didn't attach to user object (since no user)
+                    // @ts-ignore
+                    const headerTenant = req.headers['x-tenant-id'] as string;
+                    if (!headerTenant) throw new Error('Tenant ID required');
+                    // Re-assign for use
+                    // tenantId is const in outer scope? No, it's from destructuring.
+                }
+
+                const targetTenant = tenantId || (req.headers['x-tenant-id'] as string);
+
+                finalUserId = await authService.getOrCreateGuestUser(
+                    body.passengerPhone,
+                    body.passengerName,
+                    targetTenant
+                );
+            }
+
             const input: CreateBookingInput = {
-                userId,
+                userId: finalUserId,
                 ...body,
-                channel: BookingChannel.WEB, // Default, can be overridden for POS
-                bookedBy: userId,
-                bookedByRole: roles?.[0],
-                tenantId,
-                branchId: undefined // Branch ID not in token, optional for web booking
+                channel: BookingChannel.WEB,
+                bookedBy: finalUserId, // Guest books for themselves
+                bookedByRole: roles?.[0] || 'PASSENGER',
+                tenantId: tenantId || (req.headers['x-tenant-id'] as string),
+                branchId: undefined
             };
 
             const booking = await BookingService.createBooking(input);
@@ -74,8 +104,9 @@ export class BookingController {
             if (tripId) {
                 // Get bookings for a specific trip (operator view)
                 bookings = await BookingService.getTripBookings(tripId);
-            } else if (tenantId) {
+            } else if (tenantId && role !== 'PASSENGER' && role !== 'GUEST') {
                 // Get all tenant bookings (operator/admin view)
+                // Exclude PASSENGER/GUEST from this check so they fall through to getUserBookings
                 bookings = await BookingService.getTenantBookings(tenantId, {
                     status: status as BookingStatus,
                     startDate: startDate ? new Date(startDate) : undefined,
@@ -200,14 +231,22 @@ export class BookingController {
         const roles = role ? [role] : [];
 
         try {
+            // Resolve User for POS (Walk-in)
+            const authService = new AuthService();
+            const passengerUserId = await authService.getOrCreateGuestUser(
+                body.passengerPhone,
+                body.passengerName,
+                tenantId
+            );
+
             const input: CreateBookingInput = {
                 ...body,
-                userId: body.passengerPhone, // Use phone as userId for walk-in customers
+                userId: passengerUserId, // Use the resolved persistent User ID
                 channel: BookingChannel.POS,
-                bookedBy: userId,
+                bookedBy: userId, // Operator ID
                 bookedByRole: roles?.[0],
                 tenantId,
-                branchId: undefined // Branch ID not in token
+                branchId: undefined
             };
 
             const booking = await BookingService.createBooking(input);

@@ -3,6 +3,7 @@ import { BranchAssignmentModel, IBranchAssignment, AssignmentEntityType, Assignm
 import { v4 as uuidv4 } from 'uuid';
 
 import { UserModel } from '../../identity/models/user.model';
+import { VehicleModel } from '../../fleet/models/vehicle.model';
 
 // Input type where coordinates are simple [lng, lat] array
 type BranchInput = Omit<Partial<IBranch>, 'coordinates'> & {
@@ -17,7 +18,14 @@ export class BranchService {
 
     // Branch CRUD
     static async createBranch(data: BranchInput, tenantId: string): Promise<IBranch> {
-        const branchId = uuidv4();
+        let branchId = uuidv4();
+        let isUnique = false;
+        while (!isUnique) {
+            const exists = await BranchModel.exists({ branchId });
+            if (!exists) isUnique = true;
+            else branchId = uuidv4();
+        }
+
         const branch = await BranchModel.create({
             ...data,
             coordinates: {
@@ -90,12 +98,20 @@ export class BranchService {
     ): Promise<IBranchAssignment> {
         const assignmentId = uuidv4();
 
-        // If setting as primary, unset other primaries for this entity
-        if (isPrimary) {
-            await BranchAssignmentModel.updateMany(
-                { tenantId, entityType, entityId, status: AssignmentStatus.ACTIVE },
-                { isPrimary: false }
-            );
+        // Validate Entity Existence
+        switch (entityType) {
+            case AssignmentEntityType.USER:
+            case AssignmentEntityType.DRIVER:
+                const userExists = await UserModel.exists({ userId: entityId });
+                if (!userExists) throw new Error(`User/Driver with ID ${entityId} not found`);
+                break;
+            case AssignmentEntityType.VEHICLE:
+                const vehicleExists = await VehicleModel.exists({ vehicleId: entityId });
+                if (!vehicleExists) throw new Error(`Vehicle with ID ${entityId} not found`);
+                break;
+            default:
+                // Optional: Throw error for unknown types or warn
+                console.warn(`Skipping existence check for unknown entity type: ${entityType}`);
         }
 
         // Check if already assigned
@@ -106,6 +122,14 @@ export class BranchService {
             entityId,
             status: AssignmentStatus.ACTIVE
         });
+
+        // If setting as primary, unset other primaries for this entity
+        if (isPrimary) {
+            await BranchAssignmentModel.updateMany(
+                { tenantId, entityType, entityId, status: AssignmentStatus.ACTIVE },
+                { isPrimary: false }
+            );
+        }
 
         if (existing) {
             if (existing.isPrimary !== isPrimary) {

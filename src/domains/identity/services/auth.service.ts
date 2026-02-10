@@ -22,6 +22,7 @@ interface RegisterRequest {
     lastName: string;
     role?: Role; // Default PASSENGER
     tenantName?: string; // If creating a new tenant (e.g. Operator)
+    tenantId?: string; // Optional: Override default tenant (e.g. for Guest users)
 }
 
 export class AuthService {
@@ -34,14 +35,14 @@ export class AuthService {
     }
 
     async registerUser(req: RegisterRequest): Promise<IUser> {
-        const { phone, password, firstName, lastName, role, tenantName } = req;
+        const { phone, password, firstName, lastName, role, tenantName, tenantId: inputTenantId } = req;
 
         // 1. Check Duplicates
         const existing = await UserModel.findOne({ phone });
         if (existing) throw new Error('User already exists');
 
         // 2. Resolve Tenant
-        let tenantId = 'TENANT-CITIZEN'; // Default
+        let tenantId = inputTenantId || 'TENANT-CITIZEN'; // Use input or Default
         // Logic to create new tenant if Operator/Govt registration requested
         if (role === Role.OPERATOR_ADMIN || role === Role.GOVERNMENT) {
             tenantId = `TENANT-${randomUUID()}`;
@@ -60,7 +61,17 @@ export class AuthService {
             : AccountType.LIABILITY_OPERATOR_ESCROW;
 
         // Determine Owner ID (Pre-generate user ID)
-        const userId = `USER-${randomUUID()}`;
+        let userId = `USER-${randomUUID()}`;
+        let isUnique = false;
+        while (!isUnique) {
+            const existingUser = await UserModel.exists({ userId });
+            if (!existingUser) {
+                isUnique = true;
+            } else {
+                userId = `USER-${randomUUID()}`;
+            }
+        }
+
         const walletAccountId = await this.walletService.createAccount(userId, walletType);
 
         // 4. Create User
@@ -77,6 +88,39 @@ export class AuthService {
         });
 
         return user;
+    }
+
+    /**
+     * Get or Create a Guest/Walk-in User
+     * Used for POS bookings or Web Guest bookings
+     */
+    async getOrCreateGuestUser(phone: string, name: string, tenantId: string): Promise<string> {
+        // 1. Check if user exists
+        const existingUser = await UserModel.findOne({ phone });
+        if (existingUser) {
+            return existingUser.userId;
+        }
+
+        // 2. Create new guest user
+        const names = name.split(' ');
+        const firstName = names[0];
+        const lastName = names.slice(1).join(' ') || 'Guest';
+
+        // Generate random secure password (user won't know it, but can reset it later)
+        const randomPassword = crypto.randomBytes(16).toString('hex');
+
+        // Use registration flow to ensure all side effects (Wallet, etc.) happen
+        // We assume Role.PASSENGER for guests
+        const newUser = await this.registerUser({
+            phone,
+            password: randomPassword,
+            firstName,
+            lastName,
+            role: Role.PASSENGER,
+            tenantId
+        });
+
+        return newUser.userId;
     }
 
     async login(emailOrPhone: string, password: string) {
@@ -194,27 +238,34 @@ export class AuthService {
      * Generate and send OTP for login
      */
     async sendLoginOTP(userId: string, phone: string): Promise<void> {
-        // Generate 6-digit code
-        const code = crypto.randomInt(100000, 999999).toString();
-        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+        try {
 
-        // Invalidate previous unverified OTPs
-        await OTPModel.updateMany(
-            { userId, verified: false },
-            { verified: true }
-        );
 
-        // Create new OTP
-        await OTPModel.create({
-            userId,
-            code,
-            expiresAt,
-            verified: false,
-            attempts: 0,
-        });
+            // Generate 6-digit code
+            const code = crypto.randomInt(100000, 999999).toString();
+            const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
-        // Send via SMS
-        await this.smsService.sendOTP(phone, code);
+            // Invalidate previous unverified OTPs
+            await OTPModel.updateMany(
+                { userId, verified: false },
+                { verified: true }
+            );
+
+            // Create new OTP
+            await OTPModel.create({
+                userId,
+                code,
+                expiresAt,
+                verified: false,
+                attempts: 0,
+            });
+
+            // Send via SMS
+            await this.smsService.sendOTP(phone, code);
+
+        } catch (error) {
+            console.log(error)
+        }
     }
 
     /**
