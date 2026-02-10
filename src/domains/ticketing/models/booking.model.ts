@@ -22,7 +22,8 @@ export enum PaymentMethod {
     MOMO = 'MOMO',
     CARD = 'CARD',
     WALLET = 'WALLET',
-    BANK_TRANSFER = 'BANK_TRANSFER'
+    BANK_TRANSFER = 'BANK_TRANSFER',
+    MOBILE_MONEY = "MOBILE_MONEY"
 }
 
 export enum BookingChannel {
