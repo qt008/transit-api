@@ -66,8 +66,14 @@ export class TripService {
                         status: TripStatus.SCHEDULED,
                         currentStopIndex: 0,
 
-                        totalSeats: vehicle.capacity || 40,
-                        availableSeats: vehicle.capacity || 40,
+                        totalSeats: vehicle.seatLayout?.seats?.filter((s: any) => s.type === 'SEAT').length
+                            || vehicle.totalSeats
+                            || vehicle.capacity
+                            || 40,
+                        availableSeats: vehicle.seatLayout?.seats?.filter((s: any) => s.type === 'SEAT').length
+                            || vehicle.totalSeats
+                            || vehicle.capacity
+                            || 40,
                         bookedSeats: [],
 
                         stops: route.stops,

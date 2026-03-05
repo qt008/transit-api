@@ -158,7 +158,7 @@ export class AuthService {
 
         // No 2FA - generate and return tokens
         const accessToken = jwt.sign(
-            { id: user.userId, role: user.roles[0], tenantId: user.tenantId },
+            { id: user.userId, role: user.roles[0], tenantId: user.tenantId, walletAccountId: user.walletAccountId },
             JWT_SECRET,
             { expiresIn: '15m' }
         );
@@ -305,7 +305,7 @@ export class AuthService {
 
         // Generate tokens
         const accessToken = jwt.sign(
-            { id: user.userId, role: user.roles[0], tenantId: user.tenantId },
+            { id: user.userId, role: user.roles[0], tenantId: user.tenantId, walletAccountId: user.walletAccountId },
             JWT_SECRET,
             { expiresIn: '15m' }
         );
@@ -347,7 +347,7 @@ export class AuthService {
 
             // Generate new access token
             const accessToken = jwt.sign(
-                { id: user.userId, role: user.roles[0], tenantId: user.tenantId },
+                { id: user.userId, role: user.roles[0], tenantId: user.tenantId, walletAccountId: user.walletAccountId },
                 JWT_SECRET,
                 { expiresIn: '15m' }
             );
