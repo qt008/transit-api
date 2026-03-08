@@ -1,5 +1,6 @@
 import { UserModel, Role, IUser } from '../models/user.model';
 import { TenantModel, TenantType } from '../models/tenant.model';
+import { TenantService } from './tenant.service';
 import { WalletService } from '../../wallet/services/wallet.service';
 import { AccountType } from '../../wallet/models/account.model';
 import { PasswordResetModel } from '../models/password-reset.model';
@@ -42,15 +43,32 @@ export class AuthService {
         if (existing) throw new Error('User already exists');
 
         // 2. Resolve Tenant
-        let tenantId = inputTenantId || 'TENANT-CITIZEN'; // Use input or Default
-        // Logic to create new tenant if Operator/Govt registration requested
-        if (role === Role.OPERATOR_ADMIN || role === Role.GOVERNMENT) {
-            tenantId = `TENANT-${randomUUID()}`;
-            await TenantModel.create({
-                tenantId,
-                name: tenantName || 'Unknown Tenant',
-                type: role === Role.OPERATOR_ADMIN ? TenantType.OPERATOR : TenantType.GOVERNMENT
+        // If a tenantId is explicitly supplied (e.g. guest user flow), use it as-is.
+        // Otherwise determine the correct tenant based on the user's role.
+        let tenantId: string;
+
+        if (inputTenantId) {
+            // Explicit override — validate it exists first
+            const tenantExists = await TenantService.tenantExists(inputTenantId);
+            if (!tenantExists) throw new Error(`Tenant '${inputTenantId}' does not exist`);
+            tenantId = inputTenantId;
+        } else if (role === Role.OPERATOR_ADMIN || role === Role.GOVERNMENT) {
+            // New company/authority signing up — create their own Tenant
+            const newTenantId = `TENANT-${randomUUID()}`;
+            await TenantService.createTenant({
+                tenantId: newTenantId,
+                name: tenantName || 'New Organisation',
+                type: role === Role.OPERATOR_ADMIN ? TenantType.OPERATOR : TenantType.GOVERNMENT,
             });
+            tenantId = newTenantId;
+        } else if (role === Role.SUPER_ADMIN) {
+            // Platform super admin — belongs to the platform tenant
+            const platformTenant = await TenantService.getOrCreatePlatformTenant();
+            tenantId = platformTenant.tenantId;
+        } else {
+            // Default: PASSENGER (and any other role) → citizen tenant
+            const citizenTenant = await TenantService.getOrCreateCitizenTenant();
+            tenantId = citizenTenant.tenantId;
         }
 
         // 3. Create Wallet (Domain B Integration)

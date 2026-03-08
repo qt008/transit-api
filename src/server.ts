@@ -19,6 +19,8 @@ import { requestIdMiddleware } from './shared/kernel/request-id.middleware';
 import { sanitizationMiddleware, xssProtection } from './shared/kernel/sanitization.middleware';
 import { branchRoutes } from './domains/fleet/branch.routes';
 import { webPublicRoutes } from './domains/fleet/web-public.routes';
+import { transitRoutes } from './domains/transit/transit.routes';
+import { financeRoutes } from './domains/finance/finance.routes';
 
 const app = fastify({
     logger: {
@@ -128,7 +130,24 @@ const start = async () => {
             web.register(webPublicRoutes, { prefix: '/public' });
             web.register(identityRoutes, { prefix: '/auth' });
             web.register(ticketingRoutes, { prefix: '/tickets' });
+            web.register(walletRoutes, { prefix: '/wallet' });
         }, { prefix: '/api/v1/web' });
+
+        // Conductor BFF (/api/v1/conductor) — driver/conductor Android devices
+        app.register(async (conductor) => {
+            conductor.register(identityRoutes, { prefix: '/auth' });
+            conductor.register(transitRoutes, { prefix: '/transit' });
+            conductor.register(ticketingRoutes, { prefix: '/tickets' });
+            conductor.register(fleetRoutes, { prefix: '/fleet' });
+        }, { prefix: '/api/v1/conductor' });
+
+        // Stakeholder BFF (/api/v1/stakeholder) — investors and finance oversight
+        app.register(async (stakeholder) => {
+            stakeholder.register(identityRoutes, { prefix: '/auth' });
+            stakeholder.register(financeRoutes, { prefix: '/finance' });
+            stakeholder.register(analyticsRoutes, { prefix: '/analytics' });
+            stakeholder.register(walletRoutes, { prefix: '/wallet' });
+        }, { prefix: '/api/v1/stakeholder' });
 
         // Payment Webhooks (/api/v1/payments)
         app.register(async (app) => {

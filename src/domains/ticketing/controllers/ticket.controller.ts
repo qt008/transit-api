@@ -8,14 +8,20 @@ import { getPaginationParams, createPaginatedResponse } from '../../../shared/ke
 
 const walletService = new WalletService();
 
-const PurchaseTicketSchema = z.object({
+export const PurchaseTicketSchema = z.object({
     routeId: z.string(),
     tripId: z.string().optional()
 });
 
-const ValidateTicketSchema = z.object({
+export const ValidateTicketSchema = z.object({
     ticketId: z.string(),
     signature: z.string()
+});
+
+export const ValidateQRSchema = z.object({
+    qrPayload: z.string().min(1, 'qrPayload is required'),
+    deviceId: z.string().min(1, 'deviceId is required'),
+    tripId: z.string().optional()
 });
 
 export class TicketController {
@@ -241,5 +247,132 @@ export class TicketController {
     static async syncValidation(req: FastifyRequest, reply: FastifyReply) {
         // Legacy endpoint - kept for backward compatibility
         return reply.send({ success: true, message: 'Sync endpoint deprecated' });
+    }
+
+    /**
+     * GET /tickets/manifest/:tripId
+     * Returns a signed manifest of all valid ticket hashes for a trip.
+     * Downloaded by conductor devices at trip start for offline validation.
+     * Intentionally lightweight: only the data needed for local HMAC verification.
+     */
+    static async getTripManifest(req: FastifyRequest, reply: FastifyReply) {
+        const { tripId } = req.params as { tripId: string };
+
+        // Only valid, non-expired tickets for this trip
+        const tickets = await TicketModel.find({
+            tripId,
+            status: { $in: [TicketStatus.ISSUED, TicketStatus.VALIDATED] },
+            expiresAt: { $gt: new Date() }
+        })
+            .select('ticketId userId routeId price expiresAt signature status')
+            .lean();
+
+        const manifest = {
+            tripId,
+            generatedAt: new Date().toISOString(),
+            ticketCount: tickets.length,
+            tickets: tickets.map(t => ({
+                ticketId: t.ticketId,
+                userId: t.userId,
+                routeId: t.routeId,
+                price: t.price,
+                expiresAt: t.expiresAt,
+                signature: t.signature,
+                status: t.status
+            }))
+        };
+
+        // Sign the manifest itself so the device can verify it wasn't tampered with
+        const crypto = await import('crypto');
+        const manifestPayload = JSON.stringify({ tripId, generatedAt: manifest.generatedAt, ticketCount: manifest.ticketCount });
+        const manifestSignature = crypto
+            .createHmac('sha256', process.env.TICKET_SECRET || 'ticket-secret')
+            .update(manifestPayload)
+            .digest('hex');
+
+        return reply.send({
+            success: true,
+            data: { ...manifest, manifestSignature }
+        });
+    }
+
+    /**
+     * POST /tickets/validate-qr
+     * Online QR validation endpoint for conductor devices.
+     * Accepts the raw QR payload JSON (as scanned by camera).
+     */
+    static async validateQR(req: FastifyRequest, reply: FastifyReply) {
+        const { qrPayload: rawPayload, deviceId, tripId } = req.body as {
+            qrPayload: string;
+            deviceId: string;
+            tripId?: string;
+        };
+
+        // Decode HTML entities before parsing (QR scanner libraries may encode " as &quot;)
+        const qrPayload = rawPayload
+            .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+
+        try {
+            let parsed: { ticketId: string; signature: string; expiresAt: string };
+            try {
+                parsed = JSON.parse(qrPayload);
+            } catch {
+                throw new Error('Invalid QR code format');
+            }
+
+            const ticket = await TicketModel.findOne({ ticketId: parsed.ticketId });
+            if (!ticket) throw new Error('Ticket not found');
+
+            // Verify signature
+            const isValid = QRCodeService.verifyTicketSignature(
+                ticket.ticketId,
+                ticket.userId,
+                ticket.routeId,
+                ticket.price,
+                ticket.expiresAt,
+                parsed.signature
+            );
+            if (!isValid) throw new Error('Invalid ticket — signature mismatch');
+
+            if (QRCodeService.isExpired(ticket.expiresAt)) {
+                ticket.status = TicketStatus.EXPIRED;
+                await ticket.save();
+                throw new Error('Ticket expired');
+            }
+
+            if (ticket.status === TicketStatus.USED || ticket.status === TicketStatus.CANCELLED) {
+                throw new Error(`Ticket is ${ticket.status.toLowerCase()}`);
+            }
+
+            // Optional: verify ticket belongs to this trip
+            if (tripId && ticket.tripId && ticket.tripId !== tripId) {
+                throw new Error('Ticket is not for this trip');
+            }
+
+            ticket.status = TicketStatus.VALIDATED;
+            ticket.validatedAt = new Date();
+            ticket.validatedBy = deviceId;
+            ticket.syncStatus = 'SYNCED';
+            await ticket.save();
+
+            return reply.send({
+                success: true,
+                data: {
+                    ticketId: ticket.ticketId,
+                    userId: ticket.userId,
+                    routeId: ticket.routeId,
+                    price: ticket.price,
+                    validatedAt: ticket.validatedAt,
+                    result: 'VALID'
+                }
+            });
+        } catch (err: any) {
+            return reply.status(400).send({
+                success: false,
+                error: err.message,
+                data: { result: 'INVALID' }
+            });
+        }
     }
 }

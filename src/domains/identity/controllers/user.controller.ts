@@ -26,6 +26,7 @@ const CreateUserSchema = z.object({
     lastName: z.string().min(2),
     role: z.nativeEnum(Role),
     tenantId: z.string().optional(),
+    tenantName: z.string().optional(), // Name for new organisation when creating OPERATOR_ADMIN
     primaryBranchId: z.string().optional(),
     branchIds: z.array(z.string()).optional(),
 });

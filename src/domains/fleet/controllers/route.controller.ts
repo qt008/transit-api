@@ -2,9 +2,11 @@ import { FastifyRequest, FastifyReply } from 'fastify';
 import { RouteModel, RouteStop } from '../models/route.model';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
 import { getPaginationParams, createPaginatedResponse } from '../../../shared/kernel/pagination.helper';
 import { PricingService } from '../services/pricing.service';
 import { BranchService } from '../services/branch.service';
+import { RoutePricingModel } from '../models/route-pricing.model';
 
 const StopInputSchema = z.object({
     branchId: z.string(),
@@ -157,11 +159,17 @@ export class RouteController {
 
     /**
      * POST /routes - Create route
+     * After creating the route, automatically seeds an initial RoutePricing record so
+     * the transit system can always look up fares without a separate "set pricing" step.
+     *
+     * Seeding strategy:
+     *  - If stops carry explicit per-stop prices → build a MATRIX from those prices
+     *  - Otherwise → seed a FLAT fare rule using basePrice
      */
     static async create(req: FastifyRequest, reply: FastifyReply) {
         const body = CreateRouteSchema.parse(req.body);
         // @ts-ignore
-        const { tenantId } = req.user || {};
+        const { tenantId, userId } = req.user || {};
 
         try {
             let stops: RouteStop[] = [];
@@ -186,14 +194,63 @@ export class RouteController {
                 isActive: body.isActive ?? true,
                 basePrice: body.basePrice,
                 estimatedDuration: body.estimatedDuration,
-                geometry: geometry, // Use robust geometry
-                stops: stops,
+                geometry,
+                stops,
                 accessControl: {
-                    allowedRoles: ['PASSENGER'], // Default: passengers only
+                    allowedRoles: ['PASSENGER'],
                     allowedOperators: [],
                     restrictedTenants: []
                 }
             });
+
+            // ── Auto-seed RoutePricing ──────────────────────────────────────────
+            // Determine whether stops carry enough price data to build a MATRIX.
+            // A stop is "priced" if it has an explicit price > 0.
+            const pricedStops = stops.filter(s => s.price !== undefined && s.price > 0);
+            const sortedStops = [...stops].sort((a, b) => a.sequence - b.sequence);
+
+            let fares: any[] = [];
+            let fareRule: any = undefined;
+
+            if (pricedStops.length >= 2) {
+                // Build stop-to-stop fare matrix from the per-stop prices.
+                // Convention: stop.price is the fare FROM the route origin TO that stop.
+                // We compute pair fares as: Math.abs(toStop.price - fromStop.price)
+                for (let i = 0; i < sortedStops.length; i++) {
+                    for (let j = i + 1; j < sortedStops.length; j++) {
+                        const from = sortedStops[i];
+                        const to = sortedStops[j];
+                        const fromPrice = from.price ?? 0;
+                        const toPrice = to.price ?? body.basePrice;
+                        fares.push({
+                            fromStopId: from.stopId,
+                            fromStopName: from.name,
+                            toStopId: to.stopId,
+                            toStopName: to.name,
+                            price: Math.max(toPrice - fromPrice, 0)
+                        });
+                    }
+                }
+            } else {
+                // Fall back to a FLAT rule — the operator can refine pricing later
+                fareRule = { type: 'FLAT' };
+            }
+
+            await RoutePricingModel.create({
+                routePricingId: `PRICING-${uuidv4()}`,
+                routeId: route.routeId,
+                tenantId,
+                fares,
+                fareRule,
+                version: 1,
+                effectiveFrom: new Date(),
+                isActive: true,
+                createdBy: userId || tenantId,
+                notes: fares.length > 0
+                    ? `Auto-generated matrix from ${fares.length} stop pairs on route creation`
+                    : 'Auto-generated FLAT rule on route creation — update with actual fares'
+            });
+            // ───────────────────────────────────────────────────────────────────
 
             return reply.status(201).send({ success: true, data: route });
         } catch (err: any) {

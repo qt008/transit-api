@@ -1,33 +1,38 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { WalletService } from '../services/wallet.service';
+import { WalletQRService } from '../services/wallet-qr.service';
 import { MobileMoneyService } from '../services/mobile-money.service';
 import { LedgerEntryModel } from '../models/ledger-entry.model';
 import { AccountModel } from '../models/account.model';
 import { z } from 'zod';
 import { getPaginationParams, createPaginatedResponse } from '../../../shared/kernel/pagination.helper';
-import { MobileMoneyProvider } from '../models/mobile-money-transaction.model';
+import { MobileMoneyProvider, MobileMoneyTransactionModel } from '../models/mobile-money-transaction.model';
 
 const walletService = new WalletService();
 const mobileMoneyService = new MobileMoneyService();
 
-const TopupSchema = z.object({
+export const TopupSchema = z.object({
     provider: z.enum(['MTN', 'VODAFONE', 'AIRTELTIGO']),
-    phoneNumber: z.string().regex(/^0\d{9}$/),
-    amount: z.number().min(100) // Minimum 1 GHS
+    phoneNumber: z.string().regex(/^0\d{9}$/, 'phoneNumber must be a 10-digit Ghanaian number starting with 0'),
+    amount: z.number().min(100, 'Minimum top-up is GHS 1.00')
 });
 
-const WithdrawSchema = z.object({
+export const SimulateCallbackSchema = z.object({
+    transactionId: z.string().min(1, 'transactionId is required'),
+});
+
+export const WithdrawSchema = z.object({
     provider: z.enum(['MTN', 'VODAFONE', 'AIRTELTIGO']),
-    phoneNumber: z.string().regex(/^0\d{9}$/),
-    amount: z.number().min(100)
+    phoneNumber: z.string().regex(/^0\d{9}$/, 'phoneNumber must be a 10-digit Ghanaian number starting with 0'),
+    amount: z.number().min(100, 'Minimum withdrawal is GHS 1.00')
 });
 
-const TransferSchema = z.object({
-    recipientWalletId: z.string(),
-    amount: z.number().min(100)
+export const TransferSchema = z.object({
+    recipientWalletId: z.string().min(1, 'recipientWalletId is required'),
+    amount: z.number().min(100, 'Minimum transfer is GHS 1.00')
 });
 
-const WebhookSchema = z.object({
+export const WebhookSchema = z.object({
     providerTransactionId: z.string(),
     status: z.enum(['success', 'failed']),
     signature: z.string()
@@ -133,6 +138,50 @@ export class WalletController {
     }
 
     /**
+     * POST /wallet/topup/simulate-callback
+     * Dev helper: instantly approves a pending top-up by calling
+     * handleWebhook with status 'success'. This simulates the
+     * mobile money provider approving the payment.
+     */
+    static async simulateTopupCallback(req: FastifyRequest, reply: FastifyReply) {
+        const { transactionId } = SimulateCallbackSchema.parse(req.body);
+
+        try {
+            // Find the pending tx by our internal transactionId
+            const tx = await MobileMoneyTransactionModel.findOne({ transactionId });
+            if (!tx) return reply.status(404).send({ error: 'Transaction not found' });
+            if (tx.callbackReceived) return reply.send({ success: true, data: { message: 'Already processed' } });
+
+            // Simulate the provider approval
+            await mobileMoneyService.handleWebhook(
+                tx.providerTransactionId!,
+                'success',
+                { simulated: true, approvedAt: new Date().toISOString() }
+            );
+
+            // Fetch updated balance
+            // @ts-ignore
+            const walletId = req.user?.walletAccountId;
+            let balance: number | undefined;
+            if (walletId) {
+                const account = await AccountModel.findOne({ accountId: walletId });
+                balance = account?.balance;
+            }
+
+            return reply.send({
+                success: true,
+                data: {
+                    message: 'Top-up approved (simulated)',
+                    transactionId,
+                    balance,
+                }
+            });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
      * POST /wallet/withdraw - Withdraw to mobile money
      */
     static async withdraw(req: FastifyRequest, reply: FastifyReply) {
@@ -184,6 +233,35 @@ export class WalletController {
             });
         } catch (err: any) {
             return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * GET /wallet/me/qr - Get signed wallet QR payload
+     * Returns the JSON string that clients render as a QR code.
+     */
+    static async getMyWalletQR(req: FastifyRequest, reply: FastifyReply) {
+        // @ts-ignore
+        const userId = req.user.id;
+        // @ts-ignore
+        const walletAccountId = req.user.walletAccountId;
+
+        if (!walletAccountId) {
+            return reply.status(400).send({ error: 'No wallet associated with this account' });
+        }
+
+        try {
+            const qrPayload = WalletQRService.generatePayload(userId, walletAccountId);
+
+            return reply.send({
+                success: true,
+                data: {
+                    qrPayload,
+                    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+                }
+            });
+        } catch (err: any) {
+            return reply.status(500).send({ error: err.message });
         }
     }
 }

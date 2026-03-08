@@ -1,5 +1,6 @@
 import { UserModel, IUser, Role } from '../models/user.model';
 import { TenantService } from './tenant.service';
+import { TenantType } from '../models/tenant.model';
 import { canCreateRole } from '../../../shared/constants/permissions';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
@@ -12,6 +13,7 @@ export interface CreateUserDto {
     lastName: string;
     role: Role;
     tenantId?: string;
+    tenantName?: string; // Used when auto-creating a new Tenant for OPERATOR_ADMIN / GOVERNMENT
     primaryBranchId?: string;
     branchIds?: string[];
 }
@@ -61,8 +63,22 @@ export class UserService {
         if (creatorRole !== Role.SUPER_ADMIN) {
             tenantId = creatorUser.tenantId;
         } else if (!tenantId) {
-            // If Super Admin and no tenantId provided, default to their own tenant
-            tenantId = creatorUser.tenantId;
+            // Super Admin creating an OPERATOR_ADMIN or GOVERNMENT user without specifying a tenant:
+            // auto-create a new Tenant for the new organisation.
+            if (userData.role === Role.OPERATOR_ADMIN || userData.role === Role.GOVERNMENT) {
+                const newTenantId = `TENANT-${uuidv4()}`;
+                await TenantService.createTenant({
+                    tenantId: newTenantId,
+                    name: userData.tenantName || 'New Organisation',
+                    type: userData.role === Role.OPERATOR_ADMIN
+                        ? TenantType.OPERATOR
+                        : TenantType.GOVERNMENT,
+                });
+                tenantId = newTenantId;
+            } else {
+                // All other roles default to the creator's (platform) tenant
+                tenantId = creatorUser.tenantId;
+            }
         }
 
         if (!tenantId) {

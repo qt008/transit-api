@@ -4,7 +4,7 @@ import { AuthService } from '../../identity/services/auth.service';
 import { BookingStatus, PaymentMethod, BookingChannel } from '../models/booking.model';
 import { z } from 'zod';
 
-const CreateBookingSchema = z.object({
+export const CreateBookingSchema = z.object({
     tripId: z.string(),
     routeId: z.string(),
     fromStopId: z.string(),
@@ -19,12 +19,12 @@ const CreateBookingSchema = z.object({
     paymentReference: z.string().nullable().optional() // Make optional/nullable for Cash
 });
 
-const ProcessPaymentSchema = z.object({
+export const ProcessPaymentSchema = z.object({
     paymentMethod: z.nativeEnum(PaymentMethod),
     paymentReference: z.string().optional()
 });
 
-const CancelBookingSchema = z.object({
+export const CancelBookingSchema = z.object({
     reason: z.string().optional()
 });
 

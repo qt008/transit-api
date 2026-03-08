@@ -4,6 +4,7 @@ import { PricingService } from '../../fleet/services/pricing.service';
 import { TripModel } from '../../fleet/models/trip.model';
 import { BranchModel } from '../../fleet/models/branch.model';
 import { TicketModel, TicketStatus } from '../models/ticket.model';
+import { QRCodeService } from './qrcode.service';
 import { LedgerEntryModel } from '../../wallet/models/ledger-entry.model';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
@@ -303,28 +304,34 @@ export class BookingService {
     }
 
     /**
-     * Generate ticket after payment
+     * Generate ticket after payment.
+     * Uses QRCodeService to produce a scannable QR PNG (data URL) and a
+     * globally-verifiable HMAC-SHA256 signature compatible with /transit/scan.
      */
     private static async generateTicket(booking: IBooking): Promise<any> {
-        const secret = crypto.randomBytes(32).toString('hex');
-        const qrData = `${booking.bookingId}:${booking.tripId}:${booking.seatNumber}`;
-        const signature = crypto
-            .createHmac('sha256', secret)
-            .update(qrData)
-            .digest('hex');
+        const ticketId = `TKT-${uuidv4()}`;
+        const expiresAt = booking.scheduledDepartureDate;
+
+        const { qrCode, signature, secret } = await QRCodeService.generateTicketQR({
+            ticketId,
+            userId: booking.userId,
+            routeId: booking.routeId,
+            price: booking.totalAmount,
+            expiresAt,
+        });
 
         const ticket = await TicketModel.create({
-            ticketId: `TKT-${uuidv4()}`,
+            ticketId,
             userId: booking.userId,
             routeId: booking.routeId,
             tripId: booking.tripId,
 
-            qrCode: Buffer.from(qrData).toString('base64'),
+            qrCode,       // data:image/png;base64,... — actual scannable QR image
             price: booking.totalAmount,
 
             secret,
             signature,
-            expiresAt: booking.scheduledDepartureDate,
+            expiresAt,
 
             status: TicketStatus.ISSUED,
             syncStatus: 'SYNCED'
@@ -529,11 +536,19 @@ export class BookingService {
             }
         }
 
+        // Include ticket QR code if the booking has been paid
+        let qrCode: string | undefined;
+        if (booking.ticketId) {
+            const ticket = await TicketModel.findOne({ ticketId: booking.ticketId }).lean();
+            qrCode = ticket?.qrCode;
+        }
+
         return {
             ...booking,
             passengerDepartureDate: departureTime,
             passengerArrivalDate: arrivalTime,
-            tripDurationMinutes: durationMinutes
+            tripDurationMinutes: durationMinutes,
+            ...(qrCode ? { qrCode } : {})
         };
     }
 
