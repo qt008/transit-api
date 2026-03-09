@@ -106,7 +106,32 @@ export class AuthController {
 
     static async me(req: FastifyRequest, reply: FastifyReply) {
         // req.user is populated by JWT middleware
-        return reply.send({ user: req.user });
+        // @ts-ignore
+        const userId = req.user.id || req.user.userId;
+
+        try {
+            const user = await UserModel.findOne({ userId });
+            if (!user) {
+                return reply.status(404).send({ error: 'User not found' });
+            }
+
+            const safeUser = {
+                userId: user.userId,
+                email: user.email,
+                phone: user.phone,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                name: `${user.firstName} ${user.lastName}`,
+                roles: user.roles,
+                role: user.roles[0],
+                tenantId: user.tenantId,
+                mfaEnabled: user.mfaEnabled,
+            };
+
+            return reply.send({ user: safeUser });
+        } catch (err: any) {
+            return reply.status(500).send({ error: 'Internal server error while fetching profile' });
+        }
     }
 
     static async forgotPassword(req: FastifyRequest, reply: FastifyReply) {
