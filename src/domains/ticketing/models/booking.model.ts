@@ -59,6 +59,8 @@ export interface IBooking extends Document {
 
     // Seat assignment
     seatNumber: string;
+    /** Additional seats booked in the same transaction (multi-seat booking) */
+    additionalSeats?: string[];
 
     // Pricing
     baseFare: number; // In pesewas
@@ -94,8 +96,17 @@ export interface IBooking extends Document {
     tenantId: string;
     branchId?: string; // Branch where booking was made
 
-    // Ticket reference (created after payment)
+    // Ticket reference(s) — one per seat, created after payment
     ticketId?: string;
+    /** All ticketIds for this booking (primary + additional seats) */
+    ticketIds?: string[];
+
+    // Stop sequences — used for stop-segmented seat reservation overlap checks
+    fromSequence?: number;
+    toSequence?: number;
+
+    /** Groups multiple single-seat bookings made together (e.g. family booking) */
+    groupId?: string;
 
     createdAt: Date;
     updatedAt: Date;
@@ -121,7 +132,8 @@ const BookingSchema = new Schema({
     passengerEmail: { type: String },
     passengerIdNumber: { type: String },
 
-    seatNumber: { type: String, required: true },
+    seatNumber:      { type: String, required: true },
+    additionalSeats: { type: [String], default: [] },
 
     baseFare: { type: Number, required: true },
     discount: { type: Number, default: 0 },
@@ -164,7 +176,12 @@ const BookingSchema = new Schema({
     tenantId: { type: String, required: true, index: true },
     branchId: { type: String, index: true },
 
-    ticketId: { type: String, index: true },
+    ticketId:  { type: String, index: true },
+    ticketIds: { type: [String], default: [] },
+
+    fromSequence: { type: Number },
+    toSequence:   { type: Number },
+    groupId:      { type: String, index: true },
 }, {
     timestamps: true
 });
@@ -174,6 +191,7 @@ BookingSchema.index({ tripId: 1, status: 1 });
 BookingSchema.index({ userId: 1, status: 1, scheduledDepartureDate: -1 });
 BookingSchema.index({ branchId: 1, scheduledDepartureDate: 1 });
 BookingSchema.index({ paymentStatus: 1, createdAt: -1 });
-BookingSchema.index({ tripId: 1, seatNumber: 1 }, { unique: true, sparse: true }); // Prevent double-booking same seat
+// Non-unique — stop-segmented conflict prevention is handled by SeatReservationModel
+BookingSchema.index({ tripId: 1, seatNumber: 1 });
 
 export const BookingModel = model<IBooking>('Booking', BookingSchema);

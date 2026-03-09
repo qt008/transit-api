@@ -222,7 +222,7 @@ export class TripController {
     }
 
     /**
-     * GET /trips/:id/availability - Get seat availability
+     * GET /trips/:id/availability - Get seat availability (legacy global view)
      */
     static async getAvailability(req: FastifyRequest, reply: FastifyReply) {
         const { id } = req.params as { id: string };
@@ -230,6 +230,51 @@ export class TripController {
         try {
             const availability = await TripService.getTripAvailability(id);
             return reply.send({ success: true, data: availability });
+        } catch (err: any) {
+            return reply.status(400).send({ error: err.message });
+        }
+    }
+
+    /**
+     * GET /trips/:id/seats?fromStopId=X&toStopId=Y
+     * Returns seats available for a specific stop segment (stop-segmented reservation model).
+     * When fromStopId/toStopId are omitted, returns globally available seats.
+     */
+    static async getSeatsForSegment(req: FastifyRequest, reply: FastifyReply) {
+        const { id } = req.params as { id: string };
+        const { fromStopId, toStopId } = req.query as { fromStopId?: string; toStopId?: string };
+
+        try {
+            const trip = await TripModel.findOne({ tripId: id }).lean();
+            if (!trip) return reply.status(404).send({ error: 'Trip not found' });
+
+            let fromSequence = 0;
+            let toSequence   = 1;
+
+            if (fromStopId && toStopId && trip.stops.length > 0) {
+                const fromStop = trip.stops.find((s: any) => s.stopId === fromStopId);
+                const toStop   = trip.stops.find((s: any) => s.stopId === toStopId);
+                fromSequence   = fromStop?.sequence ?? 0;
+                toSequence     = toStop?.sequence   ?? (fromSequence + 1);
+            }
+
+            // Import lazily to avoid circular deps
+            const { getSegmentAvailableSeats } = await import('../../ticketing/services/booking.service');
+            const availableSeats = await getSegmentAvailableSeats(id, fromSequence, toSequence);
+
+            return reply.send({
+                success: true,
+                data: {
+                    tripId: id,
+                    fromStopId,
+                    toStopId,
+                    fromSequence,
+                    toSequence,
+                    availableSeats,
+                    availableCount: availableSeats.length,
+                    totalSeats:     trip.totalSeats,
+                }
+            });
         } catch (err: any) {
             return reply.status(400).send({ error: err.message });
         }

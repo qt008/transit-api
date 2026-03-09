@@ -1,13 +1,22 @@
 import { BookingModel, IBooking, BookingStatus, PaymentStatus, PaymentMethod, BookingChannel } from '../models/booking.model';
+import { SeatReservationModel, SeatReservationStatus } from '../models/seat-reservation.model';
 import { TripService } from '../../fleet/services/trip.service';
 import { PricingService } from '../../fleet/services/pricing.service';
 import { TripModel } from '../../fleet/models/trip.model';
+import { VehicleModel } from '../../fleet/models/vehicle.model';
 import { BranchModel } from '../../fleet/models/branch.model';
 import { TicketModel, TicketStatus } from '../models/ticket.model';
 import { QRCodeService } from './qrcode.service';
 import { LedgerEntryModel } from '../../wallet/models/ledger-entry.model';
+import { AccountModel } from '../../wallet/models/account.model';
+import { WalletService } from '../../wallet/services/wallet.service';
 import { v4 as uuidv4 } from 'uuid';
-import crypto from 'crypto';
+import mongoose from 'mongoose';
+import { UserModel } from '../../identity/models/user.model';
+import { SMSService } from '../../../services/sms.service';
+
+const TAX_RATE = 0.05;
+const walletService = new WalletService();
 
 function generateBookingId(): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -24,7 +33,10 @@ export interface CreateBookingInput {
     routeId: string;
     fromStopId: string;
     toStopId: string;
-    seatNumber: string;
+    /** Primary seat. Leave empty for auto-assignment. */
+    seatNumber?: string;
+    /** Additional seats for multi-seat bookings (family, group). */
+    additionalSeats?: string[];
     passengerName: string;
     passengerPhone: string;
     passengerEmail?: string;
@@ -35,169 +47,239 @@ export interface CreateBookingInput {
     tenantId: string;
     branchId?: string;
     discount?: number;
+    /** Optional group ID to link multiple bookings made together */
+    groupId?: string;
 }
 
-import mongoose from 'mongoose';
-import { UserModel } from '../../identity/models/user.model';
-import { SMSService } from '../../../services/sms.service';
-// ... existing imports
+// ─── Seat availability helper ─────────────────────────────────────────────────
 
-const TAX_RATE = 0.05;
+/**
+ * Return all seat labels (from vehicle layout) that are NOT actively
+ * reserved for the given stop sequence interval [fromSequence, toSequence).
+ * Blocking statuses: PENDING and CONFIRMED.
+ */
+export async function getSegmentAvailableSeats(
+    tripId: string,
+    fromSequence: number,
+    toSequence: number
+): Promise<string[]> {
+    // Seats blocked by overlapping active reservations
+    const blocking = await SeatReservationModel.find({
+        tripId,
+        status: { $in: [SeatReservationStatus.PENDING, SeatReservationStatus.CONFIRMED] },
+        fromSequence: { $lt: toSequence },
+        toSequence:   { $gt: fromSequence },
+    }).select('seatNumber').lean();
+
+    const takenSeats = new Set(blocking.map(r => r.seatNumber));
+
+    const trip = await TripModel.findOne({ tripId }).lean();
+    if (!trip) throw new Error('Trip not found');
+
+    const vehicle = await VehicleModel.findOne({ vehicleId: trip.vehicleId }).lean();
+
+    let allSeats: string[];
+    if (vehicle?.seatLayout?.seats?.length) {
+        allSeats = (vehicle.seatLayout.seats as any[])
+            .filter(s => s.type === 'SEAT' && s.label)
+            .map(s => s.label as string);
+    } else {
+        const total = vehicle?.totalSeats || trip.totalSeats || 40;
+        allSeats = Array.from({ length: total }, (_, i) => String(i + 1));
+    }
+
+    return allSeats.filter(s => !takenSeats.has(s));
+}
+
+/**
+ * Check whether a specific seat is free for [fromSequence, toSequence).
+ */
+async function isSeatAvailable(
+    tripId: string,
+    seatNumber: string,
+    fromSequence: number,
+    toSequence: number
+): Promise<boolean> {
+    const conflict = await SeatReservationModel.findOne({
+        tripId,
+        seatNumber,
+        status: { $in: [SeatReservationStatus.PENDING, SeatReservationStatus.CONFIRMED] },
+        fromSequence: { $lt: toSequence },
+        toSequence:   { $gt: fromSequence },
+    }).lean();
+    return !conflict;
+}
+
+// ─── BookingService ───────────────────────────────────────────────────────────
 
 export class BookingService {
+
     /**
-     * Create a new booking
+     * Create a new booking.
+     * - Resolves stop sequences for segment-aware seat locking.
+     * - Auto-assigns a seat when seatNumber is not supplied.
+     * - Creates a PENDING SeatReservation per seat immediately to hold the
+     *   seat during the payment window.
+     * - Ticket QR generation happens only after payment is confirmed.
      */
     static async createBooking(input: CreateBookingInput): Promise<IBooking> {
-        const executeBooking = async (details: { session: mongoose.ClientSession | undefined, isTransaction: boolean }) => {
-            const { session, isTransaction } = details;
+        const executeBooking = async (opts: { session: mongoose.ClientSession | undefined; isTransaction: boolean }) => {
+            const { session } = opts;
 
-            // 0. Verify User Exists
-            if (input.userId) { // userId should be required but input type suggests it is.
+            // 0. Verify user
+            if (input.userId) {
                 const userExists = await UserModel.exists({ userId: input.userId }).session(session || null);
                 if (!userExists) throw new Error('User not found');
             }
 
-            // 1. Verify trip exists and get details
+            // 1. Verify trip
             const trip = await TripModel.findOne({ tripId: input.tripId }).session(session || null);
             if (!trip) throw new Error('Trip not found');
 
-            // 1.5 Verify trip hasn't departed (Strict Date + Time Check)
+            // 1.5 Trip departure check
             const now = new Date();
-            const tripDate = new Date(trip.scheduledDepartureDate);
-
-            // Parse time string "HH:mm"
             const [hours, minutes] = (trip.scheduledDepartureTime || '00:00').split(':').map(Number);
-
-            // Set time on the trip date object
-            const departureDateTime = new Date(tripDate);
+            const departureDateTime = new Date(trip.scheduledDepartureDate);
             departureDateTime.setHours(hours, minutes, 0, 0);
 
-            // Allow 5 minutes grace period? keeping it strict for now.
             if (departureDateTime < now) {
-                // If status is COMPLETED/IN_PROGRESS, it's definitely too late
                 if (trip.status === 'COMPLETED' || trip.status === 'IN_PROGRESS') {
                     throw new Error('Trip has already departed');
                 }
-
-                // If SCHEDULED but time passed -> Error
-                throw new Error(`Trip departed at ${trip.scheduledDepartureTime} on ${tripDate.toDateString()}`);
+                throw new Error(`Trip departed at ${trip.scheduledDepartureTime} on ${new Date(trip.scheduledDepartureDate).toDateString()}`);
             }
 
             if (trip.status !== 'SCHEDULED' && trip.status !== 'DELAYED') {
                 throw new Error(`Cannot book trip with status: ${trip.status}`);
             }
 
-            // If today, check time? (Optional, maybe user wants to book last minute?)
-            // We will stick to status check + date check for now.
+            // 2. Resolve stop sequences
+            const fromStop = trip.stops.find(s => s.stopId === input.fromStopId);
+            const toStop   = trip.stops.find(s => s.stopId === input.toStopId);
+            // For point-to-point (no-stop) routes use 0 → 1 so the interval covers the full trip
+            const fromSequence = fromStop?.sequence ?? 0;
+            const toSequence   = toStop?.sequence   ?? (fromSequence + 1);
 
-            // 2. Check if seat is available (Atomic check & update)
-            const seatBooked = await TripService.bookSeat(input.tripId, input.seatNumber, session);
-            if (!seatBooked) {
-                throw new Error('Seat not available or already booked');
+            // 3. Seat assignment
+            const allSeatsToBook: string[] = [];
+
+            if (!input.seatNumber) {
+                // Auto-assign primary seat
+                const available = await getSegmentAvailableSeats(input.tripId, fromSequence, toSequence);
+                if (available.length === 0) throw new Error('No seats available for this journey segment');
+                allSeatsToBook.push(available[0]);
+            } else {
+                // Validate primary seat
+                const free = await isSeatAvailable(input.tripId, input.seatNumber, fromSequence, toSequence);
+                if (!free) throw new Error(`Seat ${input.seatNumber} is not available for this journey segment`);
+                allSeatsToBook.push(input.seatNumber);
             }
 
-            try {
-                // 3. Calculate fare
-                const fareInfo = await PricingService.calculateFare(
-                    input.routeId,
-                    input.fromStopId,
-                    input.toStopId
-                );
-
-                const baseFare = fareInfo.price;
-                const discount = input.discount || 0;
-                const taxAmount = Math.round(baseFare * TAX_RATE);
-                const totalAmount = baseFare - discount + taxAmount;
-
-                // 4. Get stop/branch names
-                let fromStopName = trip.stops.find(s => s.stopId === input.fromStopId)?.name;
-                let toStopName = trip.stops.find(s => s.stopId === input.toStopId)?.name;
-
-                // If not found in stops, check if they are branches (Direct Trip)
-                if (!fromStopName) {
-                    const fromBranch = await BranchModel.findOne({ branchId: input.fromStopId }).session(session || null);
-                    if (fromBranch) fromStopName = fromBranch.name;
-                }
-
-                if (!toStopName) {
-                    const toBranch = await BranchModel.findOne({ branchId: input.toStopId }).session(session || null);
-                    if (toBranch) toStopName = toBranch.name;
-                }
-
-                if (!fromStopName || !toStopName) {
-                    throw new Error('Invalid stop or branch selection');
-                }
-
-                // 5. Create booking - with Uniqueness Check
-                let bookingId = generateBookingId();
-                let isUnique = false;
-                let attempts = 0;
-
-                while (!isUnique && attempts < 5) {
-                    const existing = await BookingModel.exists({ bookingId }).session(session || null);
-                    if (!existing) {
-                        isUnique = true;
-                    } else {
-                        bookingId = generateBookingId();
-                        attempts++;
-                    }
-                }
-
-                if (!isUnique) {
-                    throw new Error('Failed to generate unique Booking ID. Please try again.');
-                }
-
-                const [booking] = await BookingModel.create([{
-                    bookingId,
-                    userId: input.userId,
-                    tripId: input.tripId,
-
-                    routeId: input.routeId,
-                    fromStopId: input.fromStopId,
-                    fromStopName: fromStopName,
-                    toStopId: input.toStopId,
-                    toStopName: toStopName,
-
-                    scheduledDepartureDate: trip.scheduledDepartureDate,
-                    scheduledDepartureTime: trip.scheduledDepartureTime,
-
-                    passengerName: input.passengerName,
-                    passengerPhone: input.passengerPhone,
-                    passengerEmail: input.passengerEmail,
-                    passengerIdNumber: input.passengerIdNumber,
-
-                    seatNumber: input.seatNumber,
-
-                    baseFare,
-                    discount,
-                    taxAmount,
-                    totalAmount,
-
-                    paymentStatus: PaymentStatus.PENDING,
-
-                    bookedBy: input.bookedBy,
-                    bookedByRole: input.bookedByRole,
-                    bookingChannel: input.channel,
-
-                    status: BookingStatus.PENDING,
-
-                    tenantId: input.tenantId,
-                    branchId: input.branchId
-                }], { session: session || undefined });
-
-                return booking;
-            } catch (error) {
-                // If not in transaction, manually rollback seat
-                if (!isTransaction) {
-                    // Best effort rollback
-                    await TripService.releaseSeat(input.tripId, input.seatNumber).catch(console.error);
-                }
-                throw error;
+            // Additional seats (multi-seat booking)
+            for (const extra of (input.additionalSeats ?? [])) {
+                const free = await isSeatAvailable(input.tripId, extra, fromSequence, toSequence);
+                if (!free) throw new Error(`Seat ${extra} is not available for this journey segment`);
+                allSeatsToBook.push(extra);
             }
+
+            const primarySeat     = allSeatsToBook[0];
+            const additionalSeats = allSeatsToBook.slice(1);
+
+            // 4. Fare calculation
+            const fareInfo  = await PricingService.calculateFare(input.routeId, input.fromStopId, input.toStopId);
+            const baseFare  = fareInfo.price;
+            const discount  = input.discount || 0;
+            const taxAmount = Math.round(baseFare * TAX_RATE);
+            // Total per seat — multiply by number of seats
+            const perSeatTotal = baseFare - discount + taxAmount;
+            const totalAmount  = perSeatTotal * allSeatsToBook.length;
+
+            // 5. Stop names
+            let fromStopName = trip.stops.find(s => s.stopId === input.fromStopId)?.name;
+            let toStopName   = trip.stops.find(s => s.stopId === input.toStopId)?.name;
+
+            if (!fromStopName) {
+                const b = await BranchModel.findOne({ branchId: input.fromStopId }).session(session || null);
+                if (b) fromStopName = b.name;
+            }
+            if (!toStopName) {
+                const b = await BranchModel.findOne({ branchId: input.toStopId }).session(session || null);
+                if (b) toStopName = b.name;
+            }
+            if (!fromStopName || !toStopName) throw new Error('Invalid stop or branch selection');
+
+            // 6. Generate unique bookingId
+            let bookingId = generateBookingId();
+            let isUnique  = false;
+            let attempts  = 0;
+            while (!isUnique && attempts < 5) {
+                const existing = await BookingModel.exists({ bookingId }).session(session || null);
+                if (!existing) { isUnique = true; } else { bookingId = generateBookingId(); attempts++; }
+            }
+            if (!isUnique) throw new Error('Failed to generate unique Booking ID. Please try again.');
+
+            // 7. Create booking (PENDING — no ticket yet)
+            const [booking] = await BookingModel.create([{
+                bookingId,
+                userId:   input.userId,
+                tripId:   input.tripId,
+                routeId:  input.routeId,
+
+                fromStopId:   input.fromStopId,
+                fromStopName: fromStopName!,
+                toStopId:     input.toStopId,
+                toStopName:   toStopName!,
+                fromSequence,
+                toSequence,
+
+                scheduledDepartureDate: trip.scheduledDepartureDate,
+                scheduledDepartureTime: trip.scheduledDepartureTime,
+
+                passengerName:    input.passengerName,
+                passengerPhone:   input.passengerPhone,
+                passengerEmail:   input.passengerEmail,
+                passengerIdNumber: input.passengerIdNumber,
+
+                seatNumber:      primarySeat,
+                additionalSeats: additionalSeats,
+
+                baseFare:    baseFare * allSeatsToBook.length,
+                discount,
+                taxAmount:   taxAmount * allSeatsToBook.length,
+                totalAmount,
+
+                paymentStatus: PaymentStatus.PENDING,
+
+                bookedBy:       input.bookedBy,
+                bookedByRole:   input.bookedByRole,
+                bookingChannel: input.channel,
+                groupId:        input.groupId,
+
+                status:    BookingStatus.PENDING,
+                tenantId:  input.tenantId,
+                branchId:  input.branchId,
+            }], { session: session || undefined });
+
+            // 8. Create PENDING SeatReservation for every seat
+            const reservationDocs = allSeatsToBook.map(seat => ({
+                reservationId: `RSRV-${uuidv4()}`,
+                tripId:        input.tripId,
+                seatNumber:    seat,
+                bookingId:     booking.bookingId,
+                userId:        input.userId,
+                fromStopId:    input.fromStopId,
+                toStopId:      input.toStopId,
+                fromSequence,
+                toSequence,
+                status:    SeatReservationStatus.PENDING,
+                tenantId:  input.tenantId,
+            }));
+            await SeatReservationModel.insertMany(reservationDocs, { session: session || undefined } as any);
+
+            return booking;
         };
 
-        // --- Transaction Management ---
+        // Transaction wrapper (falls back gracefully on standalone MongoDB)
         const session = await mongoose.startSession();
         try {
             session.startTransaction();
@@ -206,14 +288,9 @@ export class BookingService {
             return booking;
         } catch (error: any) {
             await session.abortTransaction();
-
-            // Detect Standalone MongoDB error
             if (error.message?.includes('Transaction numbers') || error.message?.includes('replica set')) {
-                console.warn('⚠️ Transaction failed (Standalone DB detected). Retrying without transaction...');
-
-                // Retry without session/transaction
-                // Note: Data consistency is not guaranteed if process crashes mid-operation
-                return await executeBooking({ session: undefined, isTransaction: false });
+                console.warn('⚠️ Standalone DB — retrying without transaction');
+                return executeBooking({ session: undefined, isTransaction: false });
             }
             throw error;
         } finally {
@@ -222,126 +299,144 @@ export class BookingService {
     }
 
     /**
-     * Process payment for a booking
+     * Process payment for a booking.
+     * Supports WALLET (debit user's wallet) and all other payment methods.
+     * Generates one QR ticket per seat after payment is confirmed.
      */
     static async processPayment(
         bookingId: string,
         paymentMethod: PaymentMethod,
-        paymentReference?: string
-    ): Promise<{ booking: IBooking; ticket?: any }> {
+        paymentReference?: string,
+        /** Required when paymentMethod === WALLET */
+        walletAccountId?: string,
+    ): Promise<{ booking: IBooking; tickets: any[] }> {
         const booking = await BookingModel.findOne({ bookingId });
         if (!booking) throw new Error('Booking not found');
+        if (booking.paymentStatus === PaymentStatus.PAID) throw new Error('Booking already paid');
 
-        if (booking.paymentStatus === PaymentStatus.PAID) {
-            throw new Error('Booking already paid');
+        // ── Wallet payment ───────────────────────────────────────────────────
+        if (paymentMethod === PaymentMethod.WALLET) {
+            const accountId = walletAccountId;
+            if (!accountId) throw new Error('walletAccountId is required for wallet payment');
+
+            const account = await AccountModel.findOne({ accountId });
+            if (!account) throw new Error('Wallet account not found');
+            if (account.balance < booking.totalAmount) {
+                throw new Error(
+                    `Insufficient wallet balance. Required: GH₵ ${(booking.totalAmount / 100).toFixed(2)}, ` +
+                    `available: GH₵ ${(account.balance / 100).toFixed(2)}`
+                );
+            }
+            await walletService.debitWallet(
+                accountId,
+                booking.totalAmount,
+                `Ticket payment: ${booking.bookingId}`
+            );
         }
 
-        // Update booking payment status
-        booking.paymentStatus = PaymentStatus.PAID;
-        booking.paymentMethod = paymentMethod;
+        // ── Update booking ───────────────────────────────────────────────────
+        booking.paymentStatus  = PaymentStatus.PAID;
+        booking.paymentMethod  = paymentMethod;
         booking.paymentReference = paymentReference || `PAY-${uuidv4()}`;
-        booking.paidAt = new Date();
-        booking.status = BookingStatus.CONFIRMED;
+        booking.paidAt  = new Date();
+        booking.status  = BookingStatus.CONFIRMED;
         await booking.save();
 
-        // Update trip revenue
+        // Confirm seat reservations
+        await SeatReservationModel.updateMany(
+            { bookingId: booking.bookingId, status: SeatReservationStatus.PENDING },
+            { status: SeatReservationStatus.CONFIRMED }
+        );
+
+        // Trip revenue
         await TripService.addRevenue(booking.tripId, booking.totalAmount);
 
-        // --- NEW: Record Revenue in Ledger for Analytics ---
-        // Ideally we credit a "System Revenue Account" or the "Tenant Account"
-        // For now, we will just create a CREDIT entry for the Operator/Tenant to signify revenue.
-        // Since we don't have a full double-entry system setup for "Cash vs Revenue" yet, 
-        // we'll just log the CREDIT side for analytics.
-
+        // Analytics ledger entry
         try {
             await LedgerEntryModel.create({
                 transactionId: `TXN-${uuidv4()}`,
-                accountId: booking.tenantId || 'SYSTEM_REVENUE', // Or operatorId
-                amount: booking.totalAmount,
-                type: 'CREDIT', // Importing TransactionType enum would be better but string works if enum matches
-                balanceAfter: 0, // We are not strictly tracking balance for analytics-only entries if account doesn't exist
-                description: `Ticket Revenue: ${booking.bookingId}`,
+                accountId:     booking.tenantId || 'SYSTEM_REVENUE',
+                amount:        booking.totalAmount,
+                type:          'CREDIT',
+                balanceAfter:  0,
+                description:   `Ticket Revenue: ${booking.bookingId}`,
                 metadata: {
                     bookingId: booking.bookingId,
-                    tripId: booking.tripId,
-                    routeId: booking.routeId,
-                    operatorId: booking.tenantId // Important for getRevenue filtering
-                }
+                    tripId:    booking.tripId,
+                    routeId:   booking.routeId,
+                    operatorId: booking.tenantId,
+                },
             });
-        } catch (error) {
-            console.error('Failed to record ledger entry for booking:', error);
-            // Don't fail the payment if analytics log fails? 
-            // Better to fail in strict systems, but for now we catch.
+        } catch (err) {
+            console.error('Failed to record ledger entry:', err);
         }
 
-        // Generate ticket
-        const ticket = await this.generateTicket(booking);
+        // ── Generate one ticket per seat ──────────────────────────────────────
+        const allSeats = [booking.seatNumber, ...(booking.additionalSeats ?? [])];
+        const tickets: any[] = [];
 
-        // Link ticket to booking
-        booking.ticketId = ticket.ticketId;
+        for (const seat of allSeats) {
+            const ticket = await BookingService.generateTicket(booking, seat);
+            tickets.push(ticket);
+        }
+
+        // Link tickets back to booking
+        booking.ticketId  = tickets[0]?.ticketId;
+        booking.ticketIds = tickets.map(t => t.ticketId);
         await booking.save();
 
-        // Send Confirmation SMS (Async/Fire-and-forget)
+        // SMS confirmation (non-blocking)
         try {
             const smsService = new SMSService();
-            // Resolve stop names for SMS if possible (already in booking object!)
-            // booking.fromStopName / toStopName should be populated.
-
             await smsService.sendBookingConfirmation(booking.passengerPhone, {
-                bookingId: booking.bookingId,
-                origin: booking.fromStopName,
-                destination: booking.toStopName,
+                bookingId:     booking.bookingId,
+                origin:        booking.fromStopName,
+                destination:   booking.toStopName,
                 departureDate: booking.scheduledDepartureDate,
                 departureTime: booking.scheduledDepartureTime,
-                seatNumber: booking.seatNumber
+                seatNumber:    booking.seatNumber,
             });
-        } catch (smsError) {
-            console.error('Failed to send booking confirmation SMS:', smsError);
-            // Non-blocking
+        } catch (smsErr) {
+            console.error('SMS failed:', smsErr);
         }
 
-        return { booking, ticket };
+        return { booking, tickets };
     }
 
     /**
-     * Generate ticket after payment.
-     * Uses QRCodeService to produce a scannable QR PNG (data URL) and a
-     * globally-verifiable HMAC-SHA256 signature compatible with /transit/scan.
+     * Generate a single scannable QR ticket for a given seat on a booking.
      */
-    private static async generateTicket(booking: IBooking): Promise<any> {
-        const ticketId = `TKT-${uuidv4()}`;
+    private static async generateTicket(booking: IBooking, seatNumber: string): Promise<any> {
+        const ticketId  = `TKT-${uuidv4()}`;
         const expiresAt = booking.scheduledDepartureDate;
 
         const { qrCode, signature, secret } = await QRCodeService.generateTicketQR({
             ticketId,
-            userId: booking.userId,
+            userId:  booking.userId,
             routeId: booking.routeId,
-            price: booking.totalAmount,
+            price:   booking.totalAmount,
             expiresAt,
         });
 
-        const ticket = await TicketModel.create({
+        return TicketModel.create({
             ticketId,
-            userId: booking.userId,
-            routeId: booking.routeId,
-            tripId: booking.tripId,
-
-            qrCode,       // data:image/png;base64,... — actual scannable QR image
-            price: booking.totalAmount,
-
+            userId:    booking.userId,
+            routeId:   booking.routeId,
+            tripId:    booking.tripId,
+            qrCode,
+            price:     booking.totalAmount,
             secret,
             signature,
             expiresAt,
-
-            status: TicketStatus.ISSUED,
-            syncStatus: 'SYNCED'
+            status:     TicketStatus.ISSUED,
+            syncStatus: 'SYNCED',
+            // Store seat on ticket for conductor display
+            seatNumber,
         });
-
-        return ticket;
     }
 
     /**
-     * Cancel a booking
+     * Cancel a booking — releases seat reservations, optionally refunds.
      */
     static async cancelBooking(
         bookingId: string,
@@ -350,257 +445,239 @@ export class BookingService {
     ): Promise<IBooking> {
         const booking = await BookingModel.findOne({ bookingId });
         if (!booking) throw new Error('Booking not found');
+        if (booking.status === BookingStatus.CANCELLED)  throw new Error('Booking already cancelled');
+        if (booking.status === BookingStatus.COMPLETED)  throw new Error('Cannot cancel completed booking');
 
-        if (booking.status === BookingStatus.CANCELLED) {
-            throw new Error('Booking already cancelled');
+        // Release all seat reservations for this booking
+        await SeatReservationModel.updateMany(
+            { bookingId: booking.bookingId },
+            { status: SeatReservationStatus.CANCELLED }
+        );
+
+        // Keep trip counter consistent (best-effort)
+        const allSeats = [booking.seatNumber, ...(booking.additionalSeats ?? [])];
+        for (const seat of allSeats) {
+            await TripService.releaseSeat(booking.tripId, seat).catch(() => null);
         }
 
-        if (booking.status === BookingStatus.COMPLETED) {
-            throw new Error('Cannot cancel completed booking');
-        }
-
-        // Release seat
-        await TripService.releaseSeat(booking.tripId, booking.seatNumber);
-
-        // Handle refund if already paid
+        // Refund calculation
         let refundAmount = 0;
         if (booking.paymentStatus === PaymentStatus.PAID) {
-            // Calculate refund (e.g., 90% if cancelled more than 2 hours before departure)
-            const hoursUntilDeparture =
-                (booking.scheduledDepartureDate.getTime() - Date.now()) / (1000 * 60 * 60);
+            const hoursUntilDep = (booking.scheduledDepartureDate.getTime() - Date.now()) / (1000 * 60 * 60);
+            if (hoursUntilDep > 2)        refundAmount = Math.round(booking.totalAmount * 0.9);
+            else if (hoursUntilDep > 0)   refundAmount = Math.round(booking.totalAmount * 0.5);
 
-            if (hoursUntilDeparture > 2) {
-                refundAmount = Math.round(booking.totalAmount * 0.9);
-            } else if (hoursUntilDeparture > 0) {
-                refundAmount = Math.round(booking.totalAmount * 0.5);
-            }
-
-            booking.paymentStatus = refundAmount > 0 ?
-                PaymentStatus.REFUNDED : PaymentStatus.PAID;
-            booking.refundAmount = refundAmount;
-
-            // Deduct from trip revenue
+            booking.paymentStatus = refundAmount > 0 ? PaymentStatus.REFUNDED : PaymentStatus.PAID;
+            booking.refundAmount  = refundAmount;
             await TripService.addRevenue(booking.tripId, -booking.totalAmount);
         }
 
-        // Update booking
-        booking.status = BookingStatus.CANCELLED;
-        booking.cancelledAt = new Date();
-        booking.cancelledBy = cancelledBy;
+        booking.status             = BookingStatus.CANCELLED;
+        booking.cancelledAt        = new Date();
+        booking.cancelledBy        = cancelledBy;
         booking.cancellationReason = reason;
         await booking.save();
 
-        // Cancel ticket if exists
-        if (booking.ticketId) {
-            await TicketModel.updateOne(
-                { ticketId: booking.ticketId },
-                { status: TicketStatus.CANCELLED }
-            );
+        // Cancel all tickets
+        const ticketIds = booking.ticketIds?.length ? booking.ticketIds : (booking.ticketId ? [booking.ticketId] : []);
+        if (ticketIds.length) {
+            await TicketModel.updateMany({ ticketId: { $in: ticketIds } }, { status: TicketStatus.CANCELLED });
         }
 
         return booking;
     }
 
     /**
-     * Check-in a booking
+     * Check-in a booking (CONFIRMED → CHECKED_IN).
      */
-    static async checkInBooking(
-        bookingId: string,
-        checkedInBy: string
-    ): Promise<IBooking> {
+    static async checkInBooking(bookingId: string, checkedInBy: string): Promise<IBooking> {
         const booking = await BookingModel.findOne({ bookingId });
         if (!booking) throw new Error('Booking not found');
+        if (booking.status !== BookingStatus.CONFIRMED) throw new Error('Only confirmed bookings can be checked in');
 
-        if (booking.status !== BookingStatus.CONFIRMED) {
-            throw new Error('Only confirmed bookings can be checked in');
-        }
-
-        booking.status = BookingStatus.CHECKED_IN;
-        booking.checkedInAt = new Date();
-        booking.checkedInBy = checkedInBy;
+        booking.status       = BookingStatus.CHECKED_IN;
+        booking.checkedInAt  = new Date();
+        booking.checkedInBy  = checkedInBy;
         await booking.save();
-
         return booking;
     }
 
     /**
-     * Get user bookings
+     * Release seat reservations when a journey closes (tap-off).
+     * Marks the booking COMPLETED and all its SeatReservations RELEASED.
      */
+    static async releaseSeatsOnJourneyClose(userId: string, tripId: string): Promise<void> {
+        const bookings = await BookingModel.find({
+            userId,
+            tripId,
+            status: { $in: [BookingStatus.CONFIRMED, BookingStatus.CHECKED_IN] },
+            paymentStatus: PaymentStatus.PAID,
+        });
+
+        for (const booking of bookings) {
+            await SeatReservationModel.updateMany(
+                { bookingId: booking.bookingId, status: SeatReservationStatus.CONFIRMED },
+                { status: SeatReservationStatus.RELEASED, releasedAt: new Date() }
+            );
+            await BookingModel.updateOne(
+                { bookingId: booking.bookingId },
+                { status: BookingStatus.COMPLETED }
+            );
+        }
+    }
+
+    /**
+     * Fetch pre-booked confirmed tickets for a user on a trip at a given stop.
+     * Used by the transit scan flow to detect pre-booked passengers.
+     * Returns an array of ticket data ready for conductor display/printing.
+     */
+    static async getPreBookedTickets(
+        userId: string,
+        tripId: string,
+        currentStopSequence: number,
+    ): Promise<Array<{
+        bookingId:    string;
+        seatNumber:   string;
+        passengerName: string;
+        fromStopName: string;
+        toStopName:   string;
+        ticketId:     string;
+        qrCode:       string;
+    }>> {
+        // Find confirmed bookings where the current stop falls within the booked segment
+        const bookings = await BookingModel.find({
+            userId,
+            tripId,
+            status:        { $in: [BookingStatus.CONFIRMED, BookingStatus.CHECKED_IN] },
+            paymentStatus: PaymentStatus.PAID,
+            fromSequence:  { $lte: currentStopSequence },
+            toSequence:    { $gt:  currentStopSequence },
+        }).lean();
+
+        if (!bookings.length) return [];
+
+        const results: any[] = [];
+
+        for (const b of bookings) {
+            const ticketIds = b.ticketIds?.length ? b.ticketIds : (b.ticketId ? [b.ticketId] : []);
+            const allSeats  = [b.seatNumber, ...(b.additionalSeats ?? [])];
+
+            for (let i = 0; i < ticketIds.length; i++) {
+                const ticket = await TicketModel.findOne({ ticketId: ticketIds[i] }).lean();
+                if (!ticket) continue;
+                results.push({
+                    bookingId:    b.bookingId,
+                    seatNumber:   (ticket as any).seatNumber || allSeats[i] || b.seatNumber,
+                    passengerName: b.passengerName,
+                    fromStopName: b.fromStopName,
+                    toStopName:   b.toStopName,
+                    ticketId:     ticket.ticketId,
+                    qrCode:       ticket.qrCode,
+                });
+            }
+        }
+
+        return results;
+    }
+
+    // ─── Query methods (unchanged) ─────────────────────────────────────────
+
     static async getUserBookings(
         userId: string,
-        filters?: {
-            status?: BookingStatus;
-            startDate?: Date;
-            endDate?: Date;
-        }
+        filters?: { status?: BookingStatus; startDate?: Date; endDate?: Date }
     ): Promise<IBooking[]> {
         const query: any = { userId };
-
-        if (filters?.status) {
-            query.status = filters.status;
-        }
-
+        if (filters?.status) query.status = filters.status;
         if (filters?.startDate || filters?.endDate) {
             query.scheduledDepartureDate = {};
-            if (filters.startDate) {
-                query.scheduledDepartureDate.$gte = filters.startDate;
-            }
-            if (filters.endDate) {
-                query.scheduledDepartureDate.$lte = filters.endDate;
-            }
+            if (filters?.startDate) query.scheduledDepartureDate.$gte = filters.startDate;
+            if (filters?.endDate)   query.scheduledDepartureDate.$lte = filters.endDate;
         }
-
-        return BookingModel.find(query)
-            .sort({ scheduledDepartureDate: -1 })
-            .limit(50);
+        return BookingModel.find(query).sort({ scheduledDepartureDate: -1 }).limit(50);
     }
 
-    /**
-     * Get tenant bookings (for operators/admins)
-     */
     static async getTenantBookings(
         tenantId: string,
-        filters?: {
-            status?: BookingStatus;
-            startDate?: Date;
-            endDate?: Date;
-            branchId?: string;
-        }
+        filters?: { status?: BookingStatus; startDate?: Date; endDate?: Date; branchId?: string }
     ): Promise<IBooking[]> {
         const query: any = { tenantId };
-
-        if (filters?.branchId) {
-            query.branchId = filters.branchId;
-        }
-
-        if (filters?.status) {
-            query.status = filters.status;
-        }
-
+        if (filters?.branchId) query.branchId = filters.branchId;
+        if (filters?.status)   query.status    = filters.status;
         if (filters?.startDate || filters?.endDate) {
             query.scheduledDepartureDate = {};
-            if (filters.startDate) {
-                query.scheduledDepartureDate.$gte = filters.startDate;
-            }
-            if (filters.endDate) {
-                query.scheduledDepartureDate.$lte = filters.endDate;
-            }
+            if (filters?.startDate) query.scheduledDepartureDate.$gte = filters.startDate;
+            if (filters?.endDate)   query.scheduledDepartureDate.$lte = filters.endDate;
         }
-
-        return BookingModel.find(query)
-            .sort({ createdAt: -1 })
-            .limit(100);
+        return BookingModel.find(query).sort({ createdAt: -1 }).limit(100);
     }
 
-    /**
-     * Get trip bookings
-     */
     static async getTripBookings(tripId: string): Promise<IBooking[]> {
-        return BookingModel.find({ tripId })
-            .sort({ seatNumber: 1 });
+        return BookingModel.find({ tripId }).sort({ seatNumber: 1 });
     }
 
-    /**
-     * Get booking by ID
-     */
-    /**
-     * Get booking by ID
-     */
     static async getBookingById(bookingId: string): Promise<any | null> {
         const booking = await BookingModel.findOne({ bookingId }).lean();
         if (!booking) return null;
 
-        // Fetch trip to get stop offsets
         const trip = await TripModel.findOne({ tripId: booking.tripId }).lean();
 
-        let departureTime = booking.scheduledDepartureDate;
-        let arrivalTime = booking.scheduledDepartureDate;
-        let durationMinutes = 0;
+        let departureTime: Date = booking.scheduledDepartureDate;
+        let arrivalTime:   Date = booking.scheduledDepartureDate;
+        let durationMinutes     = 0;
 
         if (trip) {
             const fromStop = trip.stops.find(s => s.stopId === booking.fromStopId);
-            const toStop = trip.stops.find(s => s.stopId === booking.toStopId);
-
+            const toStop   = trip.stops.find(s => s.stopId === booking.toStopId);
             if (fromStop && toStop) {
-                // Determine base start time from trip
-                // Assuming scheduledDepartureDate includes the time, or we use scheduledDepartureTime to adjust
-                // For now, let's assume scheduledDepartureDate is correct base.
-                const baseTime = new Date(trip.scheduledDepartureDate).getTime();
-
-                const depOffset = (fromStop.estimatedArrivalMinutes || 0) * 60000;
-                const arrOffset = (toStop.estimatedArrivalMinutes || 0) * 60000;
-
-                departureTime = new Date(baseTime + depOffset);
-                arrivalTime = new Date(baseTime + arrOffset);
+                const base    = new Date(trip.scheduledDepartureDate).getTime();
+                departureTime = new Date(base + (fromStop.estimatedArrivalMinutes || 0) * 60000);
+                arrivalTime   = new Date(base + (toStop.estimatedArrivalMinutes || 0)   * 60000);
                 durationMinutes = (toStop.estimatedArrivalMinutes || 0) - (fromStop.estimatedArrivalMinutes || 0);
             }
         }
 
-        // Include ticket QR code if the booking has been paid
+        // Fetch primary QR code — prefer ticketId, fall back to first entry in ticketIds
         let qrCode: string | undefined;
-        if (booking.ticketId) {
-            const ticket = await TicketModel.findOne({ ticketId: booking.ticketId }).lean();
+        const primaryTicketId = booking.ticketId || booking.ticketIds?.[0];
+        if (primaryTicketId) {
+            const ticket = await TicketModel.findOne({ ticketId: primaryTicketId }).lean();
             qrCode = ticket?.qrCode;
         }
 
         return {
             ...booking,
             passengerDepartureDate: departureTime,
-            passengerArrivalDate: arrivalTime,
-            tripDurationMinutes: durationMinutes,
-            ...(qrCode ? { qrCode } : {})
+            passengerArrivalDate:   arrivalTime,
+            tripDurationMinutes:    durationMinutes,
+            ...(qrCode ? { qrCode } : {}),
         };
     }
 
-    /**
-     * Initiate Mobile Money Payment (PawaPay)
-     */
     static async initiateMobileMoneyPayment(bookingId: string, phone: string, provider: string): Promise<any> {
         const booking = await BookingModel.findOne({ bookingId });
         if (!booking) throw new Error('Booking not found');
 
-        // Lazy import to avoid circular dependency if any
         const { PawaPayService } = await import('../../payment/services/pawapay.service');
 
-        try {
-            // Check Env for Test Mode
-            if (process.env.PAYMENT_MODE === 'TEST') {
-                const mockDepositId = `MOCK-${uuidv4()}`;
-                console.log(`ℹ️ [BookingService] TEST MODE: Instantly processing payment for ${bookingId}`);
-
-                // Instant mock payment
-                await BookingService.processPayment(bookingId, PaymentMethod.MOBILE_MONEY, mockDepositId);
-
-                return {
-                    success: true,
-                    message: 'Mock payment successful (Test Mode)',
-                    paymentStatus: 'PAID',
-                    depositId: mockDepositId
-                };
-            }
-
-            const paymentResponse = await PawaPayService.initiateDeposit({
-                amount: (booking.totalAmount / 100).toFixed(2),
-                currency: 'GHS',
-                country: 'GH',
-                phoneNumber: phone,
-                correspondent: provider,
-                description: `TKT ${booking.bookingId}`,
-                orderId: booking.bookingId
-            });
-
-            // Update booking reference
-            booking.paymentReference = paymentResponse.depositId;
-            await booking.save();
-
-            return {
-                success: true,
-                message: 'Payment prompt sent',
-                paymentStatus: 'PENDING_AUTHORIZATION',
-                depositId: paymentResponse.depositId
-            };
-        } catch (error: any) {
-            throw new Error(error.message || 'Payment initiation failed');
+        if (process.env.PAYMENT_MODE === 'TEST') {
+            const mockId = `MOCK-${uuidv4()}`;
+            await BookingService.processPayment(bookingId, PaymentMethod.MOBILE_MONEY, mockId);
+            return { success: true, message: 'Mock payment (Test Mode)', paymentStatus: 'PAID', depositId: mockId };
         }
+
+        const response = await PawaPayService.initiateDeposit({
+            amount:       (booking.totalAmount / 100).toFixed(2),
+            currency:     'GHS',
+            country:      'GH',
+            phoneNumber:  phone,
+            correspondent: provider,
+            description:  `TKT ${booking.bookingId}`,
+            orderId:      booking.bookingId,
+        });
+
+        booking.paymentReference = response.depositId;
+        await booking.save();
+
+        return { success: true, message: 'Payment prompt sent', paymentStatus: 'PENDING_AUTHORIZATION', depositId: response.depositId };
     }
 }

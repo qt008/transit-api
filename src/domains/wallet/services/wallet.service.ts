@@ -1,5 +1,5 @@
 import mongoose, { ClientSession } from 'mongoose';
-import { AccountModel } from '../models/account.model';
+import { AccountModel, AccountType } from '../models/account.model';
 import { LedgerEntryModel, TransactionType } from '../models/ledger-entry.model';
 import { randomUUID } from 'crypto';
 
@@ -15,19 +15,16 @@ interface TransactionRequest {
 export class WalletService {
 
     /**
-     * Executes a Double-Entry Transaction with ACID guarantees.
+     * Executes a Double-Entry Transaction (without transactions for non-replica set)
      * Total Assets = Total Liabilities + Equity
      */
     async createTransaction(request: TransactionRequest): Promise<string> {
-        const session = await mongoose.startSession();
-        session.startTransaction();
-
         try {
             const { debitAccountId, creditAccountId, amount, description, metadata, idempotencyKey } = request;
 
             // 1. Idempotency Check
             if (idempotencyKey) {
-                const existingFailed = await LedgerEntryModel.findOne({ idempotencyKey }).session(session);
+                const existingFailed = await LedgerEntryModel.findOne({ idempotencyKey });
                 if (existingFailed) {
                     throw new Error(`Duplicate Transaction: ${idempotencyKey}`);
                 }
@@ -35,18 +32,16 @@ export class WalletService {
 
             const transactionId = randomUUID();
 
-            // 2. Fetch Accounts (Locking simplified for now)
-            const debitAccount = await AccountModel.findOne({ accountId: debitAccountId }).session(session);
-            const creditAccount = await AccountModel.findOne({ accountId: creditAccountId }).session(session);
+            // 2. Fetch Accounts
+            const debitAccount = await AccountModel.findOne({ accountId: debitAccountId });
+            const creditAccount = await AccountModel.findOne({ accountId: creditAccountId });
 
             if (!debitAccount || !creditAccount) {
                 throw new Error('Invalid accounts involved in transaction');
             }
 
-            // 3. Check Sufficient Funds (if needed)
-            // Liability accounts (like Escrow) can go negative depending on logic, but User Wallets (Assets) typically shouldn't.
+            // 3. Check Sufficient Funds
             if (debitAccount.balance < amount) {
-                // Allow overdraft ONLY if it's a specific system account type if needed
                 throw new Error(`Insufficient funds in account ${debitAccountId}`);
             }
 
@@ -54,10 +49,10 @@ export class WalletService {
             debitAccount.balance -= amount;
             creditAccount.balance += amount;
 
-            await debitAccount.save({ session });
-            await creditAccount.save({ session });
+            await debitAccount.save();
+            await creditAccount.save();
 
-            // 5. Create Ledger Entries (Immutable)
+            // 5. Create Ledger Entries
             await LedgerEntryModel.create([{
                 transactionId,
                 accountId: debitAccountId,
@@ -76,16 +71,11 @@ export class WalletService {
                 description,
                 metadata,
                 idempotencyKey: idempotencyKey ? `${idempotencyKey}-cr` : undefined
-            }], { session });
+            }]);
 
-            await session.commitTransaction();
             return transactionId;
-
         } catch (error) {
-            await session.abortTransaction();
             throw error;
-        } finally {
-            session.endSession();
         }
     }
 
@@ -106,6 +96,7 @@ export class WalletService {
 
     /**
      * Credit a wallet (add funds)
+     * Automatically creates the account if it doesn't exist (lazy creation)
      */
     async creditWallet(
         accountId: string,
@@ -113,17 +104,31 @@ export class WalletService {
         description: string,
         metadata: Record<string, any> = {}
     ): Promise<void> {
-        const session = await mongoose.startSession();
-        session.startTransaction();
-
         try {
-            const account = await AccountModel.findOne({ accountId }).session(session);
-            if (!account) throw new Error('Account not found');
+            let account = await AccountModel.findOne({ accountId });
+            
+            // Lazy account creation if it doesn't exist
+            if (!account) {
+                console.log(`[WalletService] Creating wallet account ${accountId} on demand`);
+                const newAccounts = await AccountModel.create([{
+                    accountId,
+                    ownerId: accountId.replace('ACCT-', '').replace('wallet-', ''),
+                    type: AccountType.ASSET_PASSENGER_WALLET,
+                    balance: 0,
+                    currency: 'GHS',
+                    isActive: true
+                }]);
+                account = newAccounts[0];
+            }
+
+            if (!account) {
+                throw new Error('Failed to create wallet account');
+            }
 
             account.balance += amount;
-            await account.save({ session });
+            await account.save();
 
-            await LedgerEntryModel.create([{
+            await LedgerEntryModel.create({
                 transactionId: randomUUID(),
                 accountId,
                 amount,
@@ -131,14 +136,9 @@ export class WalletService {
                 balanceAfter: account.balance,
                 description,
                 metadata
-            }], { session });
-
-            await session.commitTransaction();
+            });
         } catch (error) {
-            await session.abortTransaction();
             throw error;
-        } finally {
-            session.endSession();
         }
     }
 
@@ -151,18 +151,15 @@ export class WalletService {
         description: string,
         metadata: Record<string, any> = {}
     ): Promise<void> {
-        const session = await mongoose.startSession();
-        session.startTransaction();
-
         try {
-            const account = await AccountModel.findOne({ accountId }).session(session);
+            const account = await AccountModel.findOne({ accountId });
             if (!account) throw new Error('Account not found');
             if (account.balance < amount) throw new Error('Insufficient funds');
 
             account.balance -= amount;
-            await account.save({ session });
+            await account.save();
 
-            await LedgerEntryModel.create([{
+            await LedgerEntryModel.create({
                 transactionId: randomUUID(),
                 accountId,
                 amount,
@@ -170,14 +167,9 @@ export class WalletService {
                 balanceAfter: account.balance,
                 description,
                 metadata
-            }], { session });
-
-            await session.commitTransaction();
+            });
         } catch (error) {
-            await session.abortTransaction();
             throw error;
-        } finally {
-            session.endSession();
         }
     }
 }

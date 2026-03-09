@@ -83,6 +83,8 @@ export async function fleetRoutes(fastify: FastifyInstance) {
     fastify.get('/trips', { preHandler: [fastify.authenticate] }, TripController.list);
     fastify.get('/trips/:id', { preHandler: [fastify.authenticate] }, TripController.getById);
     fastify.get('/trips/:id/availability', { preHandler: [fastify.authenticate] }, TripController.getAvailability);
+    // Stop-segmented seat availability: ?fromStopId=X&toStopId=Y
+    fastify.get('/trips/:id/seats', TripController.getSeatsForSegment);
     fastify.patch('/trips/:id/status', { preHandler: [fastify.authenticate] }, TripController.updateStatus);
 
 

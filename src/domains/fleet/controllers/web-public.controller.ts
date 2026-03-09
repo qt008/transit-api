@@ -4,6 +4,7 @@ import { TripModel } from '../models/trip.model';
 import { BranchModel } from '../models/branch.model';
 import { BookingService, CreateBookingInput } from '../../ticketing/services/booking.service';
 import { PricingService } from '../services/pricing.service';
+import { SeatReservationModel, SeatReservationStatus } from "../../ticketing/models/seat-reservation.model";
 import { BookingModel, BookingChannel, PaymentMethod, BookingStatus } from '../../ticketing/models/booking.model';
 import { z } from 'zod';
 import { VehicleModel } from '../models/vehicle.model';
@@ -265,9 +266,10 @@ export class WebPublicController {
      */
     static async getTripAvailability(req: FastifyRequest, reply: FastifyReply) {
         const { id } = req.params as { id: string };
+        const { fromStopId, toStopId } = (req.query as any) || {};
         try {
             const trip = await TripModel.findOne({ tripId: id })
-                .select('tripId routeId totalSeats availableSeats bookedSeats stops vehicleId scheduledDepartureDate scheduledDepartureTime status')
+                .select('tripId routeId totalSeats stops vehicleId scheduledDepartureDate scheduledDepartureTime status')
                 .lean();
             if (!trip) return reply.status(404).send({ error: 'Trip not found' });
 
@@ -289,7 +291,7 @@ export class WebPublicController {
             const branchMap = new Map(branches.map(b => [b.branchId, b]));
 
             // Build stops list with branch names
-            const allStops = [];
+            const allStops: any[] = [];
             if (route) {
                 allStops.push({
                     stopId: route.originBranchId,
@@ -311,13 +313,38 @@ export class WebPublicController {
                 allStops.sort((a, b) => a.sequence - b.sequence);
             }
 
+            // Determine requested segment for overlap-based filtering.
+            // For no-stop trips every reservation spans the full journey (0 → 1).
+            const tripStops: any[] = (trip as any).stops || [];
+            const fromStopObj = tripStops.find((s: any) => s.stopId === fromStopId);
+            const toStopObj   = tripStops.find((s: any) => s.stopId === toStopId);
+            const reqFrom     = fromStopObj?.sequence ?? 0;
+            const reqTo       = toStopObj?.sequence   ?? (reqFrom + 1);
+
+            // Query SeatReservation — authoritative source for booked seats.
+            // When stop params are provided, only count reservations whose segment
+            // overlaps [reqFrom, reqTo). Otherwise return all active reservations.
+            const reservationFilter: any = {
+                tripId: id,
+                status: { $in: [SeatReservationStatus.PENDING, SeatReservationStatus.CONFIRMED] },
+            };
+            if (fromStopId && toStopId) {
+                reservationFilter.fromSequence = { $lt: reqTo };
+                reservationFilter.toSequence   = { $gt: reqFrom };
+            }
+
+            const activeReservations = await SeatReservationModel.find(reservationFilter)
+                .select('seatNumber').lean();
+            const bookedSeats = [...new Set(activeReservations.map((r: any) => r.seatNumber))];
+            const availableSeats = Math.max(0, (trip as any).totalSeats - bookedSeats.length);
+
             return reply.send({
                 success: true,
                 data: {
                     tripId: trip.tripId,
-                    totalSeats: trip.totalSeats,
-                    availableSeats: trip.availableSeats,
-                    bookedSeats: trip.bookedSeats,
+                    totalSeats: (trip as any).totalSeats,
+                    availableSeats,
+                    bookedSeats,
                     scheduledDepartureDate: trip.scheduledDepartureDate,
                     scheduledDepartureTime: trip.scheduledDepartureTime,
                     status: trip.status,
@@ -447,7 +474,7 @@ export class WebPublicController {
     static async getBooking(req: FastifyRequest, reply: FastifyReply) {
         const { id } = req.params as { id: string };
         try {
-            const booking = await BookingModel.findOne({ bookingId: id }).lean();
+            const booking = await BookingService.getBookingById(id);
             if (!booking) return reply.status(404).send({ error: 'Booking not found' });
 
             return reply.send({ success: true, data: booking });

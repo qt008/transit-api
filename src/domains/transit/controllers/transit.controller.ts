@@ -306,6 +306,13 @@ export class TransitController {
                 deviceId: body.deviceId,
                 tenantId,
             });
+            if (result.action === 'PREBOOKED') {
+                return reply.send({
+                    success: true, type: 'WALLET', action: 'PREBOOKED', result: 'VALID',
+                    message: result.message,
+                    data: { tickets: result.tickets }
+                });
+            }
             return reply.send({ success: true, data: result });
         } catch (err: any) {
             const statusCode = err.message.includes('not found') ? 404 : 400;
@@ -382,13 +389,20 @@ export class TransitController {
                 });
             }
 
-            // Try tap-on; if passenger already has an open journey on this trip → tap-off
+            // Try tap-on; if pre-booked → show tickets; if already has open journey → tap-off
             try {
                 const result = await transitService.tapOnByWallet({
                     userId: verified.userId,
                     walletAccountId: verified.walletAccountId,
                     tripId, stopId: stopId ?? '', deviceId, tenantId
                 });
+                if (result.action === 'PREBOOKED') {
+                    return reply.send({
+                        success: true, type: 'WALLET', action: 'PREBOOKED', result: 'VALID',
+                        message: result.message || 'Pre-booked ticket(s) confirmed',
+                        data: { tickets: result.tickets }
+                    });
+                }
                 return reply.send({
                     success: true, type: 'WALLET', action: 'TAP_ON', result: 'VALID',
                     message: result.message || 'Journey started — welcome aboard',

@@ -7,6 +7,7 @@ import { RouteModel } from '../../fleet/models/route.model';
 import { TripModel } from '../../fleet/models/trip.model';
 import { WalletService } from '../../wallet/services/wallet.service';
 import { AccountModel } from '../../wallet/models/account.model';
+import { BookingService } from '../../ticketing/services/booking.service';
 
 // Minimum pre-auth: charge the smallest stop-to-stop fare on boarding
 // If no matrix entry found, fall back to this % of base price
@@ -99,12 +100,29 @@ export class TransitService {
         const trip = await TripModel.findOne({ tripId, tenantId });
         if (!trip) throw new Error('Trip not found');
 
-        // For routes with no stops (point-to-point), any stopId is accepted and
-        // the full route base price is charged. For routes with stops the stop
-        // must be present on the trip.
-        const boardingStop = trip.stops.find(s => s.stopId === stopId)
-            ?? (trip.stops.length === 0 ? { stopId, name: 'Departure', sequence: 0 } : null);
-        if (!boardingStop) throw new Error('Stop not on this trip route');
+        // For journeys without specific stop, use last stop to charge full fare
+        // This handles: no stopId provided, or stopId not found on this trip's route
+        let boardingStop = trip.stops.find(s => s.stopId === stopId);
+        
+        if (!boardingStop) {
+            if (trip.stops.length === 0) {
+                // Point-to-point route with no stops defined - use virtual departure
+                boardingStop = { 
+                    stopId: 'DEPARTURE', 
+                    name: 'Departure', 
+                    sequence: 0,
+                    branchId: '',
+                    location: { type: 'Point', coordinates: [0, 0] },
+                    estimatedArrivalMinutes: 0
+                } as any;
+            } else {
+                // No valid stopId provided — fall through to last stop for full fare
+                const sortedStops = [...trip.stops].sort((a, b) => b.sequence - a.sequence);
+                boardingStop = sortedStops[0];
+            }
+        }
+
+        if (!boardingStop) throw new Error('Unable to resolve boarding stop');
 
         // 4. Determine pre-auth amount (minimum possible fare for this route)
         const preAuthAmount = await this.resolvePreAuthAmount(trip.routeId, boardingStop.sequence, trip.stops);
@@ -136,7 +154,7 @@ export class TransitService {
             routeId: trip.routeId,
             vehicleId: trip.vehicleId,
             tenantId,
-            boardingStopId: stopId,
+            boardingStopId: boardingStop.stopId, // Use resolved stop
             boardingStopName: boardingStop.name,
             boardingStopSequence: boardingStop.sequence,
             boardedAt: new Date(),
@@ -199,10 +217,28 @@ export class TransitService {
         const trip = await TripModel.findOne({ tripId, tenantId });
         if (!trip) throw new Error('Trip not found');
 
-        // Same no-stop fallback as tap-on: accept any stopId for point-to-point routes
-        const alightingStop = trip.stops.find(s => s.stopId === stopId)
-            ?? (trip.stops.length === 0 ? { stopId, name: 'Destination', sequence: 1 } : null);
-        if (!alightingStop) throw new Error('Stop not on this trip route');
+        // For tap-off without specific stop, use last stop (destination) for full fare
+        let alightingStop = trip.stops.find(s => s.stopId === stopId);
+        
+        if (!alightingStop) {
+            if (trip.stops.length === 0) {
+                // Point-to-point route with no stops - use virtual destination
+                alightingStop = { 
+                    stopId: 'DESTINATION', 
+                    name: 'Destination', 
+                    sequence: 1,
+                    branchId: '',
+                    location: { type: 'Point', coordinates: [0, 0] },
+                    estimatedArrivalMinutes: 60
+                } as any;
+            } else {
+                // No valid stopId provided — fall through to last stop for full fare
+                const sortedStops = [...trip.stops].sort((a, b) => b.sequence - a.sequence);
+                alightingStop = sortedStops[0];
+            }
+        }
+
+        if (!alightingStop) throw new Error('Unable to resolve alighting stop');
 
         // Only enforce stop ordering when the route has actual stops
         if (trip.stops.length > 0 && alightingStop.sequence <= journey.boardingStopSequence) {
@@ -213,7 +249,7 @@ export class TransitService {
         const actualFare = await this.resolveFare(
             trip.routeId,
             journey.boardingStopId,
-            stopId
+            alightingStop.stopId
         );
 
         const preAuthAmount = journey.fare.preAuthAmount;
@@ -264,7 +300,7 @@ export class TransitService {
         await JourneyModel.updateOne(
             { journeyId: journey.journeyId },
             {
-                alightingStopId: stopId,
+                alightingStopId: alightingStop.stopId,
                 alightingStopName: alightingStop.name,
                 alightingStopSequence: alightingStop.sequence,
                 alightedAt: new Date(),
@@ -294,6 +330,9 @@ export class TransitService {
             { tripId },
             { $inc: { revenue: actualFare } }
         );
+
+        // 7. Release any pre-booked seat reservations for this user on this trip
+        await BookingService.releaseSeatsOnJourneyClose(card.userId, tripId).catch(() => null);
 
         const wallet = await AccountModel.findOne({ accountId: card.walletAccountId });
 
@@ -365,22 +404,60 @@ export class TransitService {
         const trip = await TripModel.findOne({ tripId, tenantId });
         if (!trip) throw new Error('Trip not found');
 
-        // For point-to-point routes (no stops), accept any stopId and charge full base fare
-        const boardingStop = trip.stops.find(s => s.stopId === stopId)
-            ?? (trip.stops.length === 0 ? { stopId, name: 'Departure', sequence: 0 } : null);
-        if (!boardingStop) throw new Error('Stop not on this trip route');
+        // For journeys without specific stop (conductor didn't scan), use last stop to charge full fare
+        // This handles: no stopId provided, or stopId not found on this trip's route
+        let boardingStop = trip.stops.find(s => s.stopId === stopId);
+        
+        if (!boardingStop) {
+            if (trip.stops.length === 0) {
+                // Point-to-point route with no stops defined - use virtual departure
+                boardingStop = { 
+                    stopId: 'DEPARTURE', 
+                    name: 'Departure', 
+                    sequence: 0,
+                    branchId: '',
+                    location: { type: 'Point', coordinates: [0, 0] },
+                    estimatedArrivalMinutes: 0
+                } as any;
+            } else {
+                // No valid stopId provided — fall through to last stop for full fare
+                const sortedStops = [...trip.stops].sort((a, b) => b.sequence - a.sequence);
+                boardingStop = sortedStops[0];
+            }
+        }
 
-        // 3. Pre-auth amount
+        if (!boardingStop) throw new Error('Unable to resolve boarding stop');
+
+        // 3. Check for pre-booked tickets at this stop before opening a new journey
+        const currentStopSequence = boardingStop.sequence;
+        const preBookedTickets = await BookingService.getPreBookedTickets(userId, tripId, currentStopSequence);
+
+        if (preBookedTickets.length > 0) {
+            // Mark all matching bookings as CHECKED_IN
+            const bookingIds = [...new Set(preBookedTickets.map(t => t.bookingId))];
+            for (const bookingId of bookingIds) {
+                await BookingService.checkInBooking(bookingId, deviceId).catch(() => null);
+            }
+            return {
+                action: 'PREBOOKED' as const,
+                tickets: preBookedTickets,
+                passenger: { userId },
+                via: 'WALLET_QR',
+                message: `${preBookedTickets.length} pre-booked seat(s) confirmed — no fare deducted`,
+            };
+        }
+
+        // 4. Pre-auth amount
         const preAuthAmount = await this.resolvePreAuthAmount(trip.routeId, boardingStop.sequence, trip.stops);
 
-        // 4. Check wallet balance
+        // 5. Check wallet balance
         const wallet = await AccountModel.findOne({ accountId: walletAccountId });
         if (!wallet) throw new Error('Wallet not found');
         if (wallet.balance < preAuthAmount) {
             throw new Error(`Insufficient balance. Minimum fare is GHS ${(preAuthAmount / 100).toFixed(2)}`);
         }
 
-        // 5. Pre-auth: debit wallet → operator escrow
+        // 6. Pre-auth: debit wallet → operator escrow
         const escrowAccount = await this.resolveOperatorEscrow(trip.operatorId, tenantId);
         const txnId = await walletService.createTransaction({
             debitAccountId: walletAccountId,
@@ -390,7 +467,7 @@ export class TransitService {
             metadata: { cardId: virtualCardId, tripId, stopId, type: 'PRE_AUTH', via: 'WALLET_QR' }
         });
 
-        // 6. Create Journey
+        // 7. Create Journey
         const journey = await JourneyModel.create({
             journeyId: `JRN-${randomUUID()}`,
             cardId: virtualCardId,
@@ -400,7 +477,7 @@ export class TransitService {
             routeId: trip.routeId,
             vehicleId: trip.vehicleId,
             tenantId,
-            boardingStopId: stopId,
+            boardingStopId: boardingStop.stopId, // Use resolved stop, not input (which could be empty)
             boardingStopName: boardingStop.name,
             boardingStopSequence: boardingStop.sequence,
             boardedAt: new Date(),
@@ -417,6 +494,7 @@ export class TransitService {
         });
 
         return {
+            action: 'TAP_ON' as const,
             journeyId: journey.journeyId,
             passenger: { userId },
             boardingStop: boardingStop.name,
@@ -453,10 +531,21 @@ export class TransitService {
         const trip = await TripModel.findOne({ tripId, tenantId });
         if (!trip) throw new Error('Trip not found');
 
-        // Point-to-point routes have no stops — accept any stopId, charge full base fare
-        const alightingStop = trip.stops.find(s => s.stopId === stopId)
-            ?? (trip.stops.length === 0 ? { stopId, name: 'Destination', sequence: 1 } : null);
-        if (!alightingStop) throw new Error('Stop not on this trip route');
+        // For tap-off without specific stop, use last stop (destination) for full fare
+        let alightingStop = trip.stops.find(s => s.stopId === stopId);
+
+        if (!alightingStop) {
+            if (trip.stops.length === 0) {
+                // Point-to-point route with no stops - use virtual destination
+                alightingStop = { stopId: 'DESTINATION', name: 'Destination', sequence: 1, branchId: '', location: { type: 'Point', coordinates: [0, 0] }, estimatedArrivalMinutes: 60 } as any;
+            } else {
+                // No valid stopId provided — fall through to last stop for full fare
+                const sortedStops = [...trip.stops].sort((a, b) => b.sequence - a.sequence);
+                alightingStop = sortedStops[0];
+            }
+        }
+
+        if (!alightingStop) throw new Error('Unable to resolve alighting stop');
 
         // Only enforce ordering for routes that actually have defined stops
         if (trip.stops.length > 0 && alightingStop.sequence <= journey.boardingStopSequence) {
@@ -464,7 +553,7 @@ export class TransitService {
         }
 
         // 3. Calculate actual fare (falls back to route.basePrice when no fare matrix)
-        const actualFare = await this.resolveFare(trip.routeId, journey.boardingStopId, stopId);
+        const actualFare = await this.resolveFare(trip.routeId, journey.boardingStopId, alightingStop.stopId);
         const preAuthAmount = journey.fare.preAuthAmount;
         const delta = actualFare - preAuthAmount;
         const escrowAccount = await this.resolveOperatorEscrow(trip.operatorId, tenantId);
@@ -509,7 +598,7 @@ export class TransitService {
         await JourneyModel.updateOne(
             { journeyId: journey.journeyId },
             {
-                alightingStopId: stopId,
+                alightingStopId: alightingStop.stopId,
                 alightingStopName: alightingStop.name,
                 alightingStopSequence: alightingStop.sequence,
                 alightedAt: new Date(),
@@ -530,6 +619,9 @@ export class TransitService {
             { tripId },
             { $inc: { revenue: actualFare } }
         );
+
+        // 6. Release any pre-booked seat reservations for this user on this trip
+        await BookingService.releaseSeatsOnJourneyClose(userId, tripId).catch(() => null);
 
         const wallet = await AccountModel.findOne({ accountId: walletAccountId });
 
@@ -567,10 +659,13 @@ export class TransitService {
                 const trip = await TripModel.findOne({ tripId: journey.tripId });
                 if (!trip) continue;
 
-                // Charge max fare: last stop on the route
-                const lastStop = trip.stops.sort((a, b) => b.sequence - a.sequence)[0];
-                const maxFare = await this.resolveFare(journey.routeId, journey.boardingStopId, lastStop.stopId)
-                    .catch(() => journey.fare.preAuthAmount); // fallback to pre-auth if no matrix entry
+                // Charge max fare: last stop on the route (or route base price for no-stop routes)
+                const lastStop = trip.stops.length > 0
+                    ? [...trip.stops].sort((a, b) => b.sequence - a.sequence)[0]
+                    : null;
+                const toStopId = lastStop?.stopId ?? 'DESTINATION';
+                const maxFare = await this.resolveFare(journey.routeId, journey.boardingStopId, toStopId)
+                    .catch(() => journey.fare.preAuthAmount); // fallback to pre-auth if no fare defined
 
                 const escrowAccount = await this.resolveOperatorEscrow(trip.operatorId, journey.tenantId);
                 const delta = maxFare - journey.fare.preAuthAmount;
@@ -594,7 +689,7 @@ export class TransitService {
                         status: JourneyStatus.ORPHANED,
                         orphanedAt: new Date(),
                         orphanedReason: tripId ? 'Trip completed without tap-off' : 'Orphan window exceeded',
-                        alightingStopName: lastStop.name,
+                        ...(lastStop ? { alightingStopName: lastStop.name } : {}),
                         fare: {
                             ...journey.fare,
                             finalCharge: maxFare,

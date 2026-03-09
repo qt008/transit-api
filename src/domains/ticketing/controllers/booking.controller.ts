@@ -5,23 +5,29 @@ import { BookingStatus, PaymentMethod, BookingChannel } from '../models/booking.
 import { z } from 'zod';
 
 export const CreateBookingSchema = z.object({
-    tripId: z.string(),
-    routeId: z.string(),
-    fromStopId: z.string(),
-    toStopId: z.string(),
-    seatNumber: z.string(),
-    passengerName: z.string(),
-    passengerPhone: z.string(),
-    passengerEmail: z.string().email().optional(),
+    tripId:            z.string(),
+    routeId:           z.string(),
+    fromStopId:        z.string(),
+    toStopId:          z.string(),
+    /** Leave empty for auto seat assignment */
+    seatNumber:        z.string().optional(),
+    /** Extra seats for group/family bookings */
+    additionalSeats:   z.array(z.string()).optional(),
+    passengerName:     z.string(),
+    passengerPhone:    z.string(),
+    passengerEmail:    z.string().email().optional(),
     passengerIdNumber: z.string().optional(),
-    discount: z.number().optional(),
-    paymentMethod: z.enum(['CASH', 'CARD', 'MOBILE_MONEY']).optional(), // New field for POS choice
-    paymentReference: z.string().nullable().optional() // Make optional/nullable for Cash
+    discount:          z.number().optional(),
+    paymentMethod:     z.enum(['CASH', 'CARD', 'MOBILE_MONEY', 'WALLET']).optional(),
+    paymentReference:  z.string().nullable().optional(),
+    groupId:           z.string().optional(),
 });
 
 export const ProcessPaymentSchema = z.object({
-    paymentMethod: z.nativeEnum(PaymentMethod),
-    paymentReference: z.string().optional()
+    paymentMethod:   z.nativeEnum(PaymentMethod),
+    paymentReference: z.string().optional(),
+    /** Required when paymentMethod is WALLET */
+    walletAccountId: z.string().optional(),
 });
 
 export const CancelBookingSchema = z.object({
@@ -71,11 +77,13 @@ export class BookingController {
             const input: CreateBookingInput = {
                 userId: finalUserId,
                 ...body,
-                channel: BookingChannel.WEB,
-                bookedBy: finalUserId, // Guest books for themselves
-                bookedByRole: roles?.[0] || 'PASSENGER',
-                tenantId: tenantId || (req.headers['x-tenant-id'] as string),
-                branchId: undefined
+                seatNumber:      body.seatNumber || undefined,
+                additionalSeats: body.additionalSeats || [],
+                channel:         BookingChannel.WEB,
+                bookedBy:        finalUserId,
+                bookedByRole:    roles?.[0] || 'PASSENGER',
+                tenantId:        tenantId || (req.headers['x-tenant-id'] as string),
+                branchId:        undefined,
             };
 
             const booking = await BookingService.createBooking(input);
@@ -157,11 +165,16 @@ export class BookingController {
         const { id } = req.params as { id: string };
         const body = ProcessPaymentSchema.parse(req.body);
 
+        // For wallet payments, pull walletAccountId from body or from the authenticated user
+        // @ts-ignore
+        const userWalletAccountId = body.walletAccountId || req.user?.walletAccountId;
+
         try {
             const result = await BookingService.processPayment(
                 id,
                 body.paymentMethod,
-                body.paymentReference
+                body.paymentReference,
+                userWalletAccountId,
             );
 
             return reply.send({

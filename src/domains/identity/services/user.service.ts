@@ -4,6 +4,8 @@ import { TenantType } from '../models/tenant.model';
 import { canCreateRole } from '../../../shared/constants/permissions';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
+import { WalletService } from '../../wallet/services/wallet.service';
+import { AccountType } from '../../wallet/models/account.model';
 
 export interface CreateUserDto {
     email?: string;
@@ -110,8 +112,12 @@ export class UserService {
         // Hash password
         const passwordHash = await bcrypt.hash(userData.password, 10);
 
-        // Create wallet account ID (placeholder - should integrate with wallet service)
-        const walletAccountId = `wallet-${userId}`;
+        // Create wallet account for the user
+        const walletService = new WalletService();
+        const walletType = userData.role === Role.OPERATOR_ADMIN
+            ? AccountType.LIABILITY_OPERATOR_ESCROW
+            : AccountType.ASSET_PASSENGER_WALLET;
+        const walletAccountId = await walletService.createAccount(userId, walletType);
 
         // Create user
         const newUser = new UserModel({

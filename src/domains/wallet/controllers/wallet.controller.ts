@@ -47,7 +47,20 @@ export class WalletController {
         // @ts-ignore
         const walletId = req.user.walletAccountId;
 
-        const account = await AccountModel.findOne({ accountId: walletId });
+        let account = await AccountModel.findOne({ accountId: walletId });
+        
+        // Lazy create wallet if it doesn't exist (for existing users)
+        if (!account && walletId) {
+            // Determine account type based on user role
+            // @ts-ignore
+            const userRole = req.user.role;
+            const isOperator = userRole === 'OPERATOR_ADMIN' || userRole === 'OPERATOR';
+            const accountType = isOperator ? '2100' : '1100';
+            
+            const newWalletId = await walletService.createAccount(walletId, accountType as any);
+            account = await AccountModel.findOne({ accountId: newWalletId });
+        }
+        
         if (!account) return reply.status(404).send({ error: 'Wallet not found' });
 
         return reply.send({
@@ -177,6 +190,7 @@ export class WalletController {
                 }
             });
         } catch (err: any) {
+            console.log("error",err)
             return reply.status(400).send({ error: err.message });
         }
     }
