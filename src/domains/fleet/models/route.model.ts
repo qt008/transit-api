@@ -11,7 +11,8 @@ export interface RouteStop {
     };
     sequence: number; // Order in route
     estimatedArrivalMinutes: number; // Minutes from route start
-    price?: number; // Price from origin to this stop (in pesewas)
+    price?: number;       // Cumulative fare from route origin to this stop (in pesewas)
+    distanceKm?: number;  // Cumulative road distance from route origin (km)
 }
 
 export interface RouteAccessControl {
@@ -59,7 +60,8 @@ const RouteStopSchema = new Schema({
     },
     sequence: { type: Number, required: true },
     estimatedArrivalMinutes: { type: Number, required: true },
-    price: { type: Number } // Optional specific price
+    price: { type: Number },       // Cumulative fare from route origin (pesewas)
+    distanceKm: { type: Number }   // Cumulative distance from route origin (km)
 }, { _id: false });
 
 const RouteSchema = new Schema({

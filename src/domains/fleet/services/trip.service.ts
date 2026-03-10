@@ -2,6 +2,7 @@ import { TripModel, ITrip, TripStatus } from "../models/trip.model";
 import { ScheduleModel } from "../models/schedule.model";
 import { RouteModel } from "../models/route.model";
 import { VehicleModel } from "../models/vehicle.model";
+import { BranchModel } from "../models/branch.model";
 import { v4 as uuidv4 } from "uuid";
 import mongoose, { ClientSession } from "mongoose";
 
@@ -25,6 +26,37 @@ export class TripService {
       vehicleId: schedule.vehicleId,
     });
     if (!vehicle) throw new Error("Vehicle not found");
+
+    // Build the canonical stop snapshot: origin (seq 0) + intermediates + destination (seq N+1).
+    // Storing all stops in trip.stops ensures booking and availability code can always resolve
+    // origin/destination branch IDs to their correct sequence numbers.
+    const [originBranch, destBranch] = await Promise.all([
+      BranchModel.findOne({ branchId: route.originBranchId }).select("name coordinates").lean(),
+      BranchModel.findOne({ branchId: route.destinationBranchId }).select("name coordinates").lean(),
+    ]);
+    const sortedIntermediates = [...route.stops].sort((a, b) => a.sequence - b.sequence);
+    const maxIntermediateSeq = sortedIntermediates.length > 0
+      ? sortedIntermediates[sortedIntermediates.length - 1].sequence
+      : 0;
+    const canonicalStops = [
+      {
+        stopId: route.originBranchId,
+        branchId: route.originBranchId,
+        name: originBranch?.name ?? "Origin",
+        location: originBranch?.coordinates ?? { type: "Point", coordinates: [0, 0] },
+        sequence: 0,
+        estimatedArrivalMinutes: 0,
+      },
+      ...sortedIntermediates,
+      {
+        stopId: route.destinationBranchId,
+        branchId: route.destinationBranchId,
+        name: destBranch?.name ?? "Destination",
+        location: destBranch?.coordinates ?? { type: "Point", coordinates: [0, 0] },
+        sequence: maxIntermediateSeq + 1,
+        estimatedArrivalMinutes: route.estimatedDuration,
+      },
+    ];
 
     const trips: ITrip[] = [];
     const currentDate = new Date(startDate);
@@ -82,7 +114,7 @@ export class TripService {
               40,
             bookedSeats: [],
 
-            stops: route.stops,
+            stops: canonicalStops,
 
             passengers: 0,
             revenue: 0,

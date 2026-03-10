@@ -278,7 +278,7 @@ export class WebPublicController {
                 .lean();
 
             const route = await RouteModel.findOne({ routeId: trip.routeId })
-                .select('routeId name originBranchId destinationBranchId stops')
+                .select('routeId name originBranchId destinationBranchId stops basePrice estimatedDuration')
                 .lean();
 
             const branchIds = new Set<string>();
@@ -287,39 +287,36 @@ export class WebPublicController {
                 branchIds.add(route.destinationBranchId);
                 route.stops.forEach(s => branchIds.add(s.branchId));
             }
-            const branches = await BranchModel.find({ branchId: { $in: Array.from(branchIds) } }).select('branchId name city').lean();
+            const branches = await BranchModel.find({ branchId: { $in: Array.from(branchIds) } })
+                .select('branchId name city coordinates')
+                .lean();
             const branchMap = new Map(branches.map(b => [b.branchId, b]));
 
-            // Build stops list with branch names
-            const allStops: any[] = [];
-            if (route) {
-                allStops.push({
-                    stopId: route.originBranchId,
-                    name: branchMap.get(route.originBranchId)?.name || 'Origin',
-                    sequence: -1,
-                });
-                route.stops.forEach(s => {
-                    allStops.push({
-                        stopId: s.stopId,
-                        name: branchMap.get(s.branchId)?.name || s.name,
-                        sequence: s.sequence,
-                    });
-                });
-                allStops.push({
-                    stopId: route.destinationBranchId,
-                    name: branchMap.get(route.destinationBranchId)?.name || 'Destination',
-                    sequence: 9999,
-                });
-                allStops.sort((a, b) => a.sequence - b.sequence);
-            }
-
-            // Determine requested segment for overlap-based filtering.
-            // For no-stop trips every reservation spans the full journey (0 → 1).
+            // Build the canonical stop list using the same ordering as PricingService:
+            // origin = seq 0, intermediates in sequence order, destination = maxSeq + 1.
+            // This ensures the overlap math here matches booking.service.ts exactly.
             const tripStops: any[] = (trip as any).stops || [];
-            const fromStopObj = tripStops.find((s: any) => s.stopId === fromStopId);
-            const toStopObj   = tripStops.find((s: any) => s.stopId === toStopId);
-            const reqFrom     = fromStopObj?.sequence ?? 0;
-            const reqTo       = toStopObj?.sequence   ?? (reqFrom + 1);
+            const allStops: any[] = tripStops
+                .slice()
+                .sort((a: any, b: any) => a.sequence - b.sequence)
+                .map((s: any) => ({
+                    stopId:   s.stopId,
+                    branchId: s.branchId,
+                    name:     branchMap.get(s.branchId)?.name || s.name,
+                    city:     branchMap.get(s.branchId)?.city || '',
+                    sequence: s.sequence,
+                    estimatedArrivalMinutes: s.estimatedArrivalMinutes,
+                    distanceKm: (s as any).distanceKm ?? null,
+                    isTerminal: s.stopId === route?.originBranchId || s.stopId === route?.destinationBranchId,
+                }));
+
+            // Determine the requested segment for overlap-based seat filtering.
+            const fromStopObj = allStops.find((s: any) => s.stopId === fromStopId);
+            const toStopObj   = allStops.find((s: any) => s.stopId === toStopId);
+            // Safe fallback: origin is always seq 0, destination is always last seq.
+            const lastSeq = allStops.length > 0 ? allStops[allStops.length - 1].sequence : 1;
+            const reqFrom = fromStopObj?.sequence ?? 0;
+            const reqTo   = toStopObj?.sequence   ?? lastSeq;
 
             // Query SeatReservation — authoritative source for booked seats.
             // When stop params are provided, only count reservations whose segment

@@ -1,5 +1,6 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { RouteModel, RouteStop } from '../models/route.model';
+import { BranchModel } from '../models/branch.model';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
@@ -44,15 +45,20 @@ const SetAccessControlSchema = z.object({
 export class RouteController {
 
     /**
-     * Helper to populate coordinates for stops if missing
+     * Helper to populate coordinates for stops if missing.
+     * Also computes cumulative distanceKm from the origin for each stop using
+     * the Haversine formula so the value is always stored alongside the stop.
      */
-    private static async populateStopCoordinates(stops: any[], tenantId: string): Promise<RouteStop[]> {
+    private static async populateStopCoordinates(
+        stops: any[],
+        tenantId: string,
+        originCoords?: [number, number]
+    ): Promise<RouteStop[]> {
         const processedStops: RouteStop[] = [];
 
         for (const stop of stops) {
             let location = stop.location;
 
-            // If location/coordinates missing, try to fetch from branch
             if ((!location || !location.coordinates) && stop.branchId) {
                 try {
                     const branch = await BranchService.getBranchById(stop.branchId, tenantId);
@@ -67,7 +73,6 @@ export class RouteController {
                 }
             }
 
-            // Default fallback if still missing (prevent crash, but data might be invalid geometry)
             if (!location) {
                 location = { type: 'Point', coordinates: [0, 0] };
             }
@@ -80,9 +85,83 @@ export class RouteController {
                 sequence: stop.sequence,
                 estimatedArrivalMinutes: stop.estimatedArrivalMinutes,
                 price: stop.price
-            });
+                // distanceKm is computed below after sorting
+            } as RouteStop);
         }
-        return processedStops.sort((a, b) => a.sequence - b.sequence);
+
+        const sorted = processedStops.sort((a, b) => a.sequence - b.sequence);
+
+        // Compute cumulative Haversine distance from origin for each intermediate stop.
+        if (originCoords) {
+            let prev: [number, number] = originCoords;
+            let cumKm = 0;
+            for (const stop of sorted) {
+                const curr = stop.location?.coordinates as [number, number] | undefined;
+                if (curr && (curr[0] !== 0 || curr[1] !== 0)) {
+                    cumKm += RouteController.haversineKm(prev, curr);
+                    prev = curr;
+                }
+                (stop as any).distanceKm = parseFloat(cumKm.toFixed(2));
+            }
+        }
+
+        return sorted;
+    }
+
+    /** Haversine distance in km between two [lng, lat] points */
+    private static haversineKm(a: [number, number], b: [number, number]): number {
+        const R = 6371;
+        const toRad = (d: number) => d * Math.PI / 180;
+        const dLat = toRad(b[1] - a[1]);
+        const dLon = toRad(b[0] - a[0]);
+        const sinA = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(a[1])) * Math.cos(toRad(b[1])) * Math.sin(dLon / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(sinA), Math.sqrt(1 - sinA));
+    }
+
+    /**
+     * Recompute cumulative distanceKm for an already-sorted stop array.
+     * Mutates each stop's distanceKm in place. Called after any structural change
+     * (update, addStop, removeStop) so the stored distances stay accurate.
+     */
+    private static assignCumulativeDistances(
+        sortedStops: RouteStop[],
+        originCoords: [number, number]
+    ): void {
+        let prev: [number, number] = originCoords;
+        let cumKm = 0;
+        for (const stop of sortedStops) {
+            const curr = stop.location?.coordinates as [number, number] | undefined;
+            if (curr && (curr[0] !== 0 || curr[1] !== 0)) {
+                cumKm += RouteController.haversineKm(prev, curr);
+                prev = curr;
+            }
+            (stop as any).distanceKm = parseFloat(cumKm.toFixed(2));
+        }
+    }
+
+    /**
+     * Sanitizes an array of coordinates for MongoDB's 2dsphere index.
+     * Removes consecutive duplicate coordinates. If only 1 unique point remains,
+     * adds a tiny offset to create a valid LineString.
+     */
+    private static sanitizeCoordinates(coords: number[][]): number[][] {
+        if (!coords || coords.length === 0) return [[0, 0], [0.0001, 0]];
+        if (coords.length === 1) return [coords[0], [coords[0][0] + 0.0001, coords[0][1]]];
+
+        const sanitized: number[][] = [coords[0]];
+        for (let i = 1; i < coords.length; i++) {
+            const prev = sanitized[sanitized.length - 1];
+            const curr = coords[i];
+            if (prev[0] !== curr[0] || prev[1] !== curr[1]) {
+                sanitized.push(curr);
+            }
+        }
+
+        if (sanitized.length < 2) {
+            sanitized.push([sanitized[0][0] + 0.0001, sanitized[0][1]]);
+        }
+        return sanitized;
     }
 
 
@@ -100,7 +179,7 @@ export class RouteController {
         if (explicitGeometry && explicitGeometry.length >= 2) {
             return {
                 type: 'LineString',
-                coordinates: explicitGeometry
+                coordinates: RouteController.sanitizeCoordinates(explicitGeometry)
             };
         }
 
@@ -138,33 +217,29 @@ export class RouteController {
         } catch (e) {
             console.error("Failed to construct geometry from branches", e);
             // Fallback to simple line
-            return { type: 'LineString', coordinates: [[0, 0], [0, 0]] };
-        }
-
-        // 3. Ensure validity (>= 2 points)
-        if (pathCoordinates.length < 2) {
-            // If we have 1 point (e.g. same origin/dest and no stops), add a slight offset or duplicate to make it valid
-            if (pathCoordinates.length === 1) {
-                pathCoordinates.push(pathCoordinates[0]);
-            } else {
-                return { type: 'LineString', coordinates: [[0, 0], [0, 0]] };
-            }
+            return { type: 'LineString', coordinates: RouteController.sanitizeCoordinates([[0, 0], [0, 0]]) };
         }
 
         return {
             type: 'LineString',
-            coordinates: pathCoordinates
+            coordinates: RouteController.sanitizeCoordinates(pathCoordinates)
         };
     }
 
     /**
      * POST /routes - Create route
-     * After creating the route, automatically seeds an initial RoutePricing record so
-     * the transit system can always look up fares without a separate "set pricing" step.
      *
-     * Seeding strategy:
-     *  - If stops carry explicit per-stop prices → build a MATRIX from those prices
-     *  - Otherwise → seed a FLAT fare rule using basePrice
+     * Auto-seeds an initial RoutePricing record covering ALL stop pairs including
+     * origin and destination terminals. Seeding strategy:
+     *  - If any stop carries an explicit cumulative price (price > 0):
+     *      Build a MATRIX using price deltas (toStop.price - fromStop.price)
+     *      for every forward pair in the canonical stop list.
+     *  - Otherwise:
+     *      Seed a FLAT fare rule — the operator must configure pricing via the
+     *      pricing endpoints before fares can be calculated.
+     *
+     * The 201 response includes a `pricing` preview so operators immediately
+     * see what was generated and can refine it if needed.
      */
     static async create(req: FastifyRequest, reply: FastifyReply) {
         const body = CreateRouteSchema.parse(req.body);
@@ -172,9 +247,19 @@ export class RouteController {
         const { tenantId, userId } = req.user || {};
 
         try {
+            // Fetch terminal branches up-front so their coordinates can be used
+            // for cumulative distance computation during stop population, and
+            // re-used for the pricing seed without additional DB round-trips.
+            const [originBranch, destBranch] = await Promise.all([
+                BranchModel.findOne({ branchId: body.originBranchId }).select('name coordinates').lean(),
+                BranchModel.findOne({ branchId: body.destinationBranchId }).select('name coordinates').lean()
+            ]);
+
+            const originCoords = originBranch?.coordinates?.coordinates as [number, number] | undefined;
+
             let stops: RouteStop[] = [];
             if (body.stops && body.stops.length > 0) {
-                stops = await RouteController.populateStopCoordinates(body.stops, tenantId);
+                stops = await RouteController.populateStopCoordinates(body.stops, tenantId, originCoords);
             }
 
             const geometry = await RouteController.buildRouteGeometry(
@@ -204,39 +289,60 @@ export class RouteController {
             });
 
             // ── Auto-seed RoutePricing ──────────────────────────────────────────
-            // Determine whether stops carry enough price data to build a MATRIX.
-            // A stop is "priced" if it has an explicit price > 0.
-            const pricedStops = stops.filter(s => s.price !== undefined && s.price > 0);
-            const sortedStops = [...stops].sort((a, b) => a.sequence - b.sequence);
+
+            // Build the canonical stop list (origin seq 0, intermediates, destination seq N+1)
+            const canonical = PricingService.getCanonicalStops(route as any);
+            if (originBranch) canonical[0].name = originBranch.name;
+            if (destBranch)   canonical[canonical.length - 1].name = destBranch.name;
+
+            // Compute cumulative distances for the matrix
+            const branchCoords = new Map<string, [number, number]>();
+            if (originBranch?.coordinates?.coordinates) {
+                branchCoords.set(body.originBranchId, originBranch.coordinates.coordinates as [number, number]);
+            }
+            if (destBranch?.coordinates?.coordinates) {
+                branchCoords.set(body.destinationBranchId, destBranch.coordinates.coordinates as [number, number]);
+            }
+            const cumDistances = PricingService.computeCumulativeDistances(route as any, branchCoords);
+
+            // Determine whether we have enough cumulative prices to build a MATRIX.
+            // A canonical stop is "priced" if its cumulative price > 0.
+            const pricedCanonical = canonical.filter(s => s.price !== undefined && s.price > 0);
+            const hasMatrix = pricedCanonical.length >= 2;
 
             let fares: any[] = [];
             let fareRule: any = undefined;
+            let pricingStrategy: string;
 
-            if (pricedStops.length >= 2) {
-                // Build stop-to-stop fare matrix from the per-stop prices.
-                // Convention: stop.price is the fare FROM the route origin TO that stop.
-                // We compute pair fares as: Math.abs(toStop.price - fromStop.price)
-                for (let i = 0; i < sortedStops.length; i++) {
-                    for (let j = i + 1; j < sortedStops.length; j++) {
-                        const from = sortedStops[i];
-                        const to = sortedStops[j];
-                        const fromPrice = from.price ?? 0;
-                        const toPrice = to.price ?? body.basePrice;
+            if (hasMatrix) {
+                // Build stop-to-stop fare matrix from cumulative price deltas.
+                // origin.price = 0, each stop.price = cumulative fare from origin.
+                // pair fare = toStop.price - fromStop.price
+                for (let i = 0; i < canonical.length; i++) {
+                    for (let j = i + 1; j < canonical.length; j++) {
+                        const from = canonical[i];
+                        const to   = canonical[j];
+                        const fromCum = from.price ?? 0;
+                        const toCum   = to.price   ?? body.basePrice;
+                        const fromDist = cumDistances.get(from.stopId) ?? 0;
+                        const toDist   = cumDistances.get(to.stopId)   ?? 0;
                         fares.push({
-                            fromStopId: from.stopId,
+                            fromStopId:   from.stopId,
                             fromStopName: from.name,
-                            toStopId: to.stopId,
-                            toStopName: to.name,
-                            price: Math.max(toPrice - fromPrice, 0)
+                            toStopId:     to.stopId,
+                            toStopName:   to.name,
+                            price:        Math.max(toCum - fromCum, 0),
+                            distance:     parseFloat(Math.abs(toDist - fromDist).toFixed(2))
                         });
                     }
                 }
+                pricingStrategy = 'MATRIX';
             } else {
-                // Fall back to a FLAT rule — the operator can refine pricing later
                 fareRule = { type: 'FLAT' };
+                pricingStrategy = 'FLAT';
             }
 
-            await RoutePricingModel.create({
+            const seedPricing = await RoutePricingModel.create({
                 routePricingId: `PRICING-${uuidv4()}`,
                 routeId: route.routeId,
                 tenantId,
@@ -246,13 +352,28 @@ export class RouteController {
                 effectiveFrom: new Date(),
                 isActive: true,
                 createdBy: userId || tenantId,
-                notes: fares.length > 0
-                    ? `Auto-generated matrix from ${fares.length} stop pairs on route creation`
-                    : 'Auto-generated FLAT rule on route creation — update with actual fares'
+                notes: hasMatrix
+                    ? `Auto-generated MATRIX (${fares.length} pairs) from cumulative stop prices`
+                    : 'Auto-generated FLAT rule — configure stop-to-stop fares via the pricing endpoints'
             });
             // ───────────────────────────────────────────────────────────────────
 
-            return reply.status(201).send({ success: true, data: route });
+            return reply.status(201).send({
+                success: true,
+                data: route,
+                pricing: {
+                    strategy: pricingStrategy,
+                    pricingId: seedPricing.routePricingId,
+                    fareCount: fares.length,
+                    fares: fares.map(f => ({
+                        from: f.fromStopName,
+                        to:   f.toStopName,
+                        price: f.price,
+                        distanceKm: f.distance ?? null
+                    })),
+                    note: seedPricing.notes
+                }
+            });
         } catch (err: any) {
             return reply.status(400).send({ error: err.message });
         }
@@ -332,28 +453,32 @@ export class RouteController {
         // @ts-ignore
         const { tenantId } = req.user || {};
 
-        if (updates.stops) {
-            updates.stops = await RouteController.populateStopCoordinates(updates.stops, tenantId);
-        }
-
-        // Fetch current route to check for changes if not provided in updates
         const currentRoute = await RouteModel.findOne({ routeId: id });
         if (!currentRoute) return reply.status(404).send({ error: 'Route not found' });
 
-        // Check if we need to rebuild geometry
-        // We rebuild if stops, origin, destination, or geometry is explicitly updated
         const originId = updates.originBranchId || currentRoute.originBranchId;
-        const destId = updates.destinationBranchId || currentRoute.destinationBranchId;
+        const destId   = updates.destinationBranchId || currentRoute.destinationBranchId;
+
+        // If origin is changing, or stops are being replaced, we need fresh origin coordinates
+        // so cumulative distances can be (re)computed correctly.
+        const needsOriginCoords = !!(updates.stops || updates.originBranchId);
+        let originCoords: [number, number] | undefined;
+        if (needsOriginCoords) {
+            const originBranch = await BranchModel.findOne({ branchId: originId })
+                .select('coordinates').lean();
+            originCoords = originBranch?.coordinates?.coordinates as [number, number] | undefined;
+        }
+
+        if (updates.stops) {
+            updates.stops = await RouteController.populateStopCoordinates(updates.stops, tenantId, originCoords);
+        }
+
         const stopsToUse = updates.stops || currentRoute.stops;
 
-        // If explicit geometry is invalid (e.g. coming from frontend as [0,0]), force rebuild
-        // The frontend sends coordinates: [[0,0]] when it doesn't know the path.
-        // We treat <= 1 point or [0,0] as invalid explicit geometry.
         let explicitGeo = updates.geometry?.coordinates;
         const isExplicitInvalid = !explicitGeo || explicitGeo.length < 2 || (explicitGeo.length === 1 && explicitGeo[0][0] === 0);
-
         if (isExplicitInvalid) {
-            explicitGeo = undefined; // Ignore invalid input from frontend
+            explicitGeo = undefined;
         }
 
         const geometry = await RouteController.buildRouteGeometry(
@@ -390,10 +515,22 @@ export class RouteController {
             const route = await RouteModel.findOne({ routeId: id });
             if (!route) throw new Error('Route not found');
 
-            const [stop] = await RouteController.populateStopCoordinates([stopData], tenantId);
+            // Fetch origin coordinates so the new stop's distance can be computed
+            // and all stops can be re-indexed after insertion.
+            const originBranch = await BranchModel.findOne({ branchId: route.originBranchId })
+                .select('coordinates').lean();
+            const originCoords = originBranch?.coordinates?.coordinates as [number, number] | undefined;
+
+            const [stop] = await RouteController.populateStopCoordinates([stopData], tenantId, originCoords);
 
             route.stops.push(stop);
-            route.stops.sort((a, b) => a.sequence - b.sequence); // Keep sorted
+            route.stops.sort((a, b) => a.sequence - b.sequence);
+
+            // Recompute cumulative distances for the full sorted stop list
+            if (originCoords) {
+                RouteController.assignCumulativeDistances(route.stops as RouteStop[], originCoords);
+            }
+
             await route.save();
 
             return reply.status(201).send({
@@ -412,13 +549,21 @@ export class RouteController {
     static async removeStop(req: FastifyRequest, reply: FastifyReply) {
         const { id, stopId } = req.params as { id: string; stopId: string };
 
-        const route = await RouteModel.findOneAndUpdate(
-            { routeId: id },
-            { $pull: { stops: { stopId } } },
-            { new: true }
-        );
-
+        // Pull the stop first, then recompute distances on the remaining stops.
+        const route = await RouteModel.findOne({ routeId: id });
         if (!route) return reply.status(404).send({ error: 'Route not found' });
+
+        route.stops = route.stops.filter(s => s.stopId !== stopId) as any;
+        route.stops.sort((a: any, b: any) => a.sequence - b.sequence);
+
+        const originBranch = await BranchModel.findOne({ branchId: route.originBranchId })
+            .select('coordinates').lean();
+        const originCoords = originBranch?.coordinates?.coordinates as [number, number] | undefined;
+        if (originCoords) {
+            RouteController.assignCumulativeDistances(route.stops as RouteStop[], originCoords);
+        }
+
+        await route.save();
 
         return reply.send({ success: true, message: 'Stop removed' });
     }
