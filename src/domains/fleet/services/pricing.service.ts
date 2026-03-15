@@ -86,13 +86,17 @@ export class PricingService {
         const route = await RouteModel.findOne({ routeId });
         if (!route) throw new Error('Route not found');
 
-        if (fromStopId === toStopId) {
+        const canonical = this.getCanonicalStops(route);
+        // Match by stopId OR branchId — the frontend sends branchId for intermediate stops
+        const fromStop = canonical.find(s => s.stopId === fromStopId || s.branchId === fromStopId);
+        const toStop   = canonical.find(s => s.stopId === toStopId || s.branchId === toStopId);
+        // Normalize to canonical stopIds for downstream lookups (MATRIX, FARE_RULE)
+        const resolvedFromId = fromStop?.stopId ?? fromStopId;
+        const resolvedToId   = toStop?.stopId ?? toStopId;
+
+        if (resolvedFromId === resolvedToId) {
             return { price: 0, currency: 'GHS' };
         }
-
-        const canonical = this.getCanonicalStops(route);
-        const fromStop = canonical.find(s => s.stopId === fromStopId);
-        const toStop   = canonical.find(s => s.stopId === toStopId);
 
         // 1. STOP_PRICE: stop.price is cumulative fare from origin.
         //    For a booking starting at origin the full cumPrice is used.
@@ -128,7 +132,8 @@ export class PricingService {
 
         if (pricing) {
             const fare = pricing.fares.find(
-                f => f.fromStopId === fromStopId && f.toStopId === toStopId
+                f => (f.fromStopId === resolvedFromId || f.fromStopId === fromStopId) &&
+                     (f.toStopId === resolvedToId || f.toStopId === toStopId)
             );
 
             if (fare) {
@@ -147,12 +152,13 @@ export class PricingService {
 
             // 3. Fare rule (DISTANCE / ZONE / FLAT)
             if (pricing.fareRule) {
-                return this.calculateFareByRule(pricing.fareRule, route, fromStopId, toStopId);
+                return this.calculateFareByRule(pricing.fareRule, route, resolvedFromId, resolvedToId);
             }
 
             // 4. Symmetric reverse lookup (supports bidirectional routes)
             const reverseFare = pricing.fares.find(
-                f => f.fromStopId === toStopId && f.toStopId === fromStopId
+                f => (f.fromStopId === resolvedToId || f.fromStopId === toStopId) &&
+                     (f.toStopId === resolvedFromId || f.toStopId === fromStopId)
             );
             if (reverseFare) {
                 return {
@@ -170,8 +176,8 @@ export class PricingService {
 
         // 5. BASE_PRICE fallback — only for full origin → destination journey
         const isFullRoute =
-            (fromStopId === route.originBranchId && toStopId === route.destinationBranchId) ||
-            (fromStopId === route.destinationBranchId && toStopId === route.originBranchId);
+            (resolvedFromId === route.originBranchId && resolvedToId === route.destinationBranchId) ||
+            (resolvedFromId === route.destinationBranchId && resolvedToId === route.originBranchId);
 
         if (isFullRoute) {
             return {

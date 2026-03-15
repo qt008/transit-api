@@ -2,7 +2,8 @@ import { FastifyRequest, FastifyReply } from 'fastify';
 import { PawaPayService } from '../services/pawapay.service';
 import { BookingService } from '../../ticketing/services/booking.service';
 import { PaymentMethod, BookingStatus } from '../../ticketing/models/booking.model';
-import { BookingModel } from '../../ticketing/models/booking.model'; // Need model to lookup by depositId
+import { BookingModel } from '../../ticketing/models/booking.model';
+import { SettlementModel, SettlementStatus } from '../../finance/models/settlement.model';
 
 export class PaymentController {
 
@@ -32,8 +33,22 @@ export class PaymentController {
 
             console.log(`Webhook received for ${depositId}: ${status}`);
 
-            // Find booking by paymentReference (which stores the depositId)
-            // Or by orderId in metadata if available
+            // 1. Check if this depositId belongs to a settlement payout
+            const settlement = await SettlementModel.findOne({ payoutReference: depositId });
+            if (settlement && settlement.status === SettlementStatus.PROCESSING) {
+                if (status === 'COMPLETED') {
+                    settlement.status = SettlementStatus.COMPLETED;
+                    settlement.payoutCompletedAt = new Date();
+                } else if (status === 'FAILED' || status === 'CANCELLED') {
+                    settlement.status = SettlementStatus.FAILED;
+                    settlement.payoutFailureReason = `PawaPay ${status}`;
+                }
+                await settlement.save();
+                console.log(`Settlement ${settlement.settlementId} updated to ${settlement.status} via webhook`);
+                return reply.send({ received: true });
+            }
+
+            // 2. Fall through to booking payment handling
             let booking = await BookingModel.findOne({ paymentReference: depositId });
 
             if (!booking && metadata && metadata.length > 0) {
@@ -44,7 +59,7 @@ export class PaymentController {
             }
 
             if (!booking) {
-                console.warn(`Booking not found for depositId: ${depositId}`);
+                console.warn(`No booking or settlement found for depositId: ${depositId}`);
                 return reply.send({ received: true });
             }
 
@@ -54,9 +69,6 @@ export class PaymentController {
                     console.log(`Booking ${booking.bookingId} confirmed via webhook`);
                 }
             } else if (status === 'FAILED' || status === 'CANCELLED') {
-                // Mark payment as failed logic if needed, or just log
-                // booking.paymentStatus = PaymentStatus.FAILED;
-                // await booking.save();
                 console.log(`Payment failed for ${booking.bookingId}`);
             }
 

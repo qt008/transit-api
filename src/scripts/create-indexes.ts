@@ -1,8 +1,10 @@
 import mongoose from 'mongoose';
-import { env } from '../config/env'; import { UserModel } from '../domains/identity/models/user.model';
+import { env } from '../config/env';
+import { UserModel } from '../domains/identity/models/user.model';
 import { AccountModel } from '../domains/wallet/models/account.model';
 import { LedgerEntryModel } from '../domains/wallet/models/ledger-entry.model';
 import { TicketModel } from '../domains/ticketing/models/ticket.model';
+import { BookingModel } from '../domains/ticketing/models/booking.model';
 import { VehicleModel } from '../domains/fleet/models/vehicle.model';
 import { RouteModel } from '../domains/fleet/models/route.model';
 
@@ -39,6 +41,15 @@ async function ensureIndexes() {
         await TicketModel.collection.createIndex({ tripId: 1 });
         await TicketModel.collection.createIndex({ status: 1 });
         await TicketModel.collection.createIndex({ syncStatus: 1 });
+
+        // Booking Indexes (critical for investor dashboard aggregations)
+        console.log('Creating Booking indexes...');
+        // Primary dashboard filter: tenant + paid status + date — used by all financial aggregations
+        await BookingModel.collection.createIndex({ tenantId: 1, paymentStatus: 1, paidAt: -1 });
+        // Growth metrics & collection summary secondary path
+        await BookingModel.collection.createIndex({ tenantId: 1, paymentStatus: 1, createdAt: -1 });
+        // Heatmap aggregation by departure stop
+        await BookingModel.collection.createIndex({ tenantId: 1, fromStopName: 1, paidAt: -1 });
 
         // Fleet Indexes (Geospatial)
         console.log('Creating Fleet indexes...');

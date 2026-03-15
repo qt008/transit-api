@@ -251,7 +251,7 @@ export class WebPublicController {
                     destinationCity: route ? branchMap.get(route.destinationBranchId)?.city || '' : '',
                     basePrice: route?.basePrice || 0,
                     estimatedDuration: route?.estimatedDuration || 0,
-                    vehicle: vehicle ? { make: vehicle.make, model: vehicle.model, plateNumber: vehicle.plateNumber, seatLayout: vehicle.seatLayout } : null,
+                    vehicle: vehicle ? { make: vehicle.make, model: vehicle.model, plateNumber: vehicle.plateNumber, registrationNumber: vehicle.registrationNumber, color: vehicle.color, seatLayout: vehicle.seatLayout } : null,
                 };
             });
 

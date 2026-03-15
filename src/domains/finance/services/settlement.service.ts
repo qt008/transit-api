@@ -52,8 +52,6 @@ export class SettlementService {
             paymentStatus: PaymentStatus.PAID,
             status: { $in: [BookingStatus.COMPLETED, BookingStatus.CHECKED_IN, BookingStatus.CONFIRMED] },
             paidAt: { $gte: periodStart, $lte: periodEnd },
-            // Only include bookings for this operator via tripId lookup — for simplicity we use routeId
-            // In production, join with Trip to get operatorId
         }).lean();
 
         if (bookings.length === 0) {
@@ -138,8 +136,8 @@ export class SettlementService {
     }) {
         const settlement = await SettlementModel.findOne({ settlementId });
         if (!settlement) throw new Error('Settlement not found');
-        if (settlement.status !== SettlementStatus.APPROVED) {
-            throw new Error(`Settlement must be APPROVED before payout. Current: ${settlement.status}`);
+        if (settlement.status !== SettlementStatus.APPROVED && settlement.status !== SettlementStatus.FAILED) {
+            throw new Error(`Settlement must be APPROVED (or FAILED for retry) before payout. Current: ${settlement.status}`);
         }
 
         settlement.status = SettlementStatus.PROCESSING;
@@ -149,20 +147,31 @@ export class SettlementService {
         await settlement.save();
 
         try {
-            // Resolve accounts
+            // Resolve (or lazily create) accounts
+            const ensureAccount = async (ownerId: string, type: string): Promise<any> => {
+                let account = await AccountModel.findOne({ ownerId, type });
+                if (!account) {
+                    account = await AccountModel.create({
+                        accountId: `ACCT-${randomUUID()}`,
+                        ownerId,
+                        type,
+                        balance: 0,
+                        currency: 'GHS',
+                        isActive: true
+                    });
+                }
+                return account;
+            };
+
             const escrowAccount = await AccountModel.findOne({
                 ownerId: settlement.operatorId,
                 type: '2100'
             });
-            if (!escrowAccount) throw new Error('Operator escrow account not found');
+            if (!escrowAccount) throw new Error(`Operator escrow account (2100) not found for operator ${settlement.operatorId}. Ensure funds were collected into the escrow account before settling.`);
 
             if (method === SettlementMethod.WALLET_CREDIT) {
-                // Transfer from escrow → operator revenue wallet
-                const operatorWallet = await AccountModel.findOne({
-                    ownerId: settlement.operatorId,
-                    type: '4100' // REVENUE_FARE
-                });
-                if (!operatorWallet) throw new Error('Operator revenue account not found');
+                // Transfer from escrow → operator revenue wallet (auto-create if missing)
+                const operatorWallet = await ensureAccount(settlement.operatorId, '4100');
 
                 const txnId = await walletService.createTransaction({
                     debitAccountId: escrowAccount.accountId,
@@ -176,9 +185,9 @@ export class SettlementService {
                     }
                 });
 
-                // Platform fee → platform revenue account
-                const platformAccount = await AccountModel.findOne({ ownerId: 'PLATFORM', type: '4100' });
-                if (platformAccount && settlement.totalPlatformFees > 0) {
+                // Platform fee → platform revenue account (auto-create if missing)
+                if (settlement.totalPlatformFees > 0) {
+                    const platformAccount = await ensureAccount('PLATFORM', '4100');
                     await walletService.createTransaction({
                         debitAccountId: escrowAccount.accountId,
                         creditAccountId: platformAccount.accountId,
@@ -225,9 +234,10 @@ export class SettlementService {
 
     /**
      * Collection summary across all channels — for stakeholder dashboard.
+     * tenantId is optional: undefined = platform-wide (all operators).
      */
     async getCollectionSummary(input: {
-        tenantId: string;
+        tenantId?: string;
         startDate: Date;
         endDate: Date;
         operatorId?: string;
@@ -235,63 +245,31 @@ export class SettlementService {
         const { tenantId, startDate, endDate, operatorId } = input;
 
         const matchFilter: any = {
-            tenantId,
             paymentStatus: PaymentStatus.PAID,
             paidAt: { $gte: startDate, $lte: endDate }
         };
+        if (tenantId) matchFilter.tenantId = tenantId;
         if (operatorId) matchFilter.operatorId = operatorId;
 
         const [byChannel, byMethod, byDay, totals] = await Promise.all([
-            // Revenue by booking channel
             BookingModel.aggregate([
                 { $match: matchFilter },
-                {
-                    $group: {
-                        _id: '$bookingChannel',
-                        count: { $sum: 1 },
-                        revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } }
-                    }
-                },
+                { $group: { _id: '$bookingChannel', count: { $sum: 1 }, revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } } } },
                 { $sort: { revenue: -1 } }
             ]),
-
-            // Revenue by payment method
             BookingModel.aggregate([
                 { $match: matchFilter },
-                {
-                    $group: {
-                        _id: '$paymentMethod',
-                        count: { $sum: 1 },
-                        revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } }
-                    }
-                },
+                { $group: { _id: '$paymentMethod', count: { $sum: 1 }, revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } } } },
                 { $sort: { revenue: -1 } }
             ]),
-
-            // Daily trend
             BookingModel.aggregate([
                 { $match: matchFilter },
-                {
-                    $group: {
-                        _id: { $dateToString: { format: '%Y-%m-%d', date: '$paidAt' } },
-                        count: { $sum: 1 },
-                        revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } }
-                    }
-                },
+                { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$paidAt' } }, count: { $sum: 1 }, revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } } } },
                 { $sort: { _id: 1 } }
             ]),
-
-            // Overall totals
             BookingModel.aggregate([
                 { $match: matchFilter },
-                {
-                    $group: {
-                        _id: null,
-                        totalBookings: { $sum: 1 },
-                        grossRevenue: { $sum: { $multiply: ['$totalAmount', 0.01] } },
-                        platformFees: { $sum: { $multiply: ['$totalAmount', DEFAULT_PLATFORM_FEE_RATE, 0.01] } }
-                    }
-                }
+                { $group: { _id: null, totalBookings: { $sum: 1 }, grossRevenue: { $sum: { $multiply: ['$totalAmount', 0.01] } }, platformFees: { $sum: { $multiply: ['$totalAmount', DEFAULT_PLATFORM_FEE_RATE, 0.01] } } } }
             ])
         ]);
 
@@ -305,28 +283,29 @@ export class SettlementService {
                 platformFees: summary.platformFees,
                 netToOperators: summary.grossRevenue - summary.platformFees
             },
-            byChannel: byChannel.map(c => ({ channel: c._id, count: c.count, revenue: c.revenue })),
-            byMethod: byMethod.map(m => ({ method: m._id, count: m.count, revenue: m.revenue })),
-            dailyTrend: byDay.map(d => ({ date: d._id, count: d.count, revenue: d.revenue }))
+            byChannel: byChannel.map((c: any) => ({ channel: c._id, count: c.count, revenue: c.revenue })),
+            byMethod: byMethod.map((m: any) => ({ method: m._id, count: m.count, revenue: m.revenue })),
+            dailyTrend: byDay.map((d: any) => ({ date: d._id, count: d.count, revenue: d.revenue }))
         };
     }
 
     /**
-     * Revenue per bus trip — for the stakeholder bus-level view.
+     * Revenue per bus trip.
+     * tenantId is optional: undefined = platform-wide.
      */
     async getBusRevenue(input: {
-        tenantId: string;
+        tenantId?: string;
         startDate: Date;
         endDate: Date;
         operatorId?: string;
     }) {
-        const { tenantId, startDate, endDate, operatorId } = input;
+        const { tenantId, startDate, endDate } = input;
 
         const matchFilter: any = {
-            tenantId,
             paymentStatus: PaymentStatus.PAID,
             scheduledDepartureDate: { $gte: startDate, $lte: endDate }
         };
+        if (tenantId) matchFilter.tenantId = tenantId;
 
         return BookingModel.aggregate([
             { $match: matchFilter },
@@ -353,5 +332,73 @@ export class SettlementService {
                 }
             }
         ]);
+    }
+
+    /**
+     * Profit and Loss — monthly GTV and platform margin.
+     * tenantId is optional: undefined = platform-wide.
+     */
+    async getProfitAndLoss(input: { tenantId?: string; startDate: Date; endDate: Date }) {
+        const { tenantId, startDate, endDate } = input;
+
+        const matchFilter: any = {
+            paymentStatus: PaymentStatus.PAID,
+            paidAt: { $gte: startDate, $lte: endDate }
+        };
+        if (tenantId) matchFilter.tenantId = tenantId;
+
+        const data = await BookingModel.aggregate([
+            { $match: matchFilter },
+            {
+                $group: {
+                    _id: { $dateToString: { format: '%Y-%m', date: '$paidAt' } },
+                    revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } },
+                    margin: { $sum: { $multiply: ['$totalAmount', DEFAULT_PLATFORM_FEE_RATE, 0.01] } }
+                }
+            },
+            { $sort: { _id: 1 } },
+            { $project: { name: '$_id', revenue: 1, margin: 1, _id: 0 } }
+        ]);
+
+        return data;
+    }
+
+    /**
+     * Growth Metrics — compares current period vs the equivalent prior period.
+     * tenantId is optional: undefined = platform-wide.
+     * @param periodDays - length of each comparison window (default 30)
+     */
+    async getGrowthMetrics(tenantId: string | undefined, periodDays: number = 30) {
+        const now = new Date();
+        const periodMs = periodDays * 24 * 60 * 60 * 1000;
+        const currentStart = new Date(now.getTime() - periodMs);
+        const previousStart = new Date(now.getTime() - 2 * periodMs);
+
+        const baseFilter: any = { paymentStatus: PaymentStatus.PAID };
+        if (tenantId) baseFilter.tenantId = tenantId;
+
+        const [current, previous] = await Promise.all([
+            BookingModel.aggregate([
+                { $match: { ...baseFilter, paidAt: { $gte: currentStart, $lte: now } } },
+                { $group: { _id: null, revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } }, count: { $sum: 1 } } }
+            ]),
+            BookingModel.aggregate([
+                { $match: { ...baseFilter, paidAt: { $gte: previousStart, $lt: currentStart } } },
+                { $group: { _id: null, revenue: { $sum: { $multiply: ['$totalAmount', 0.01] } }, count: { $sum: 1 } } }
+            ])
+        ]);
+
+        const currentRev = current[0]?.revenue || 0;
+        const lastRev = previous[0]?.revenue || 0;
+        const currentVol = current[0]?.count || 0;
+        const lastVol = previous[0]?.count || 0;
+
+        const revGrowth = lastRev > 0 ? ((currentRev - lastRev) / lastRev) * 100 : 0;
+        const volGrowth = lastVol > 0 ? ((currentVol - lastVol) / lastVol) * 100 : 0;
+
+        return {
+            revenue: { current: currentRev, previous: lastRev, growth: revGrowth.toFixed(2) },
+            volume: { current: currentVol, previous: lastVol, growth: volGrowth.toFixed(2) }
+        };
     }
 }

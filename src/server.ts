@@ -118,6 +118,7 @@ const start = async () => {
             dash.register(identityRoutes, { prefix: '/iam' });
             dash.register(driverRoutes, { prefix: '/drivers' });
             dash.register(walletRoutes, { prefix: '/finance' });
+            dash.register(financeRoutes, { prefix: '/finance' });
             dash.register(fleetRoutes, { prefix: '/ops' });
             dash.register(branchRoutes, { prefix: '/branches' });
             dash.register(analyticsRoutes, { prefix: '/analytics' });
@@ -144,6 +145,7 @@ const start = async () => {
         // Stakeholder BFF (/api/v1/stakeholder) — investors and finance oversight
         app.register(async (stakeholder) => {
             stakeholder.register(identityRoutes, { prefix: '/auth' });
+            stakeholder.register(userRoutes, { prefix: '/users' });
             stakeholder.register(financeRoutes, { prefix: '/finance' });
             stakeholder.register(analyticsRoutes, { prefix: '/analytics' });
             stakeholder.register(walletRoutes, { prefix: '/wallet' });

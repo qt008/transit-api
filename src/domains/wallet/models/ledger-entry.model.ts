@@ -30,6 +30,11 @@ const LedgerEntrySchema = new Schema<ILedgerEntry>(
     { timestamps: true }
 );
 
+// Query performance indexes
+LedgerEntrySchema.index({ createdAt: -1 });
+LedgerEntrySchema.index({ accountId: 1, createdAt: -1 });
+LedgerEntrySchema.index({ 'metadata.operatorId': 1, createdAt: -1 });
+
 // Immutable: Prevent updates/deletes
 LedgerEntrySchema.pre('updateOne', function (next) {
     next(new Error('Ledger entries are immutable'));
